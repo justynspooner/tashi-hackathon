@@ -1,0 +1,4 @@
+target/
+artifacts/
+.claude/
+.DS_Store

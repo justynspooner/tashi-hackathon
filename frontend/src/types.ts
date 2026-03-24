@@ -1,0 +1,61 @@
+export interface SharedState {
+  peer_id: string
+  last_seen_ms: number
+  role: string
+  status: string
+}
+
+export interface AgentState {
+  file: string
+  label: string
+  local: SharedState
+  peer: SharedState | null
+  last_message_kind: string
+  last_message_id: string
+  pending_role_change: {
+    message_id: string
+    sent_at_ms: number
+    role: string
+  } | null
+}
+
+export interface WireMessage {
+  kind: string
+  message_id: string
+  sent_at_ms: number
+  state: SharedState
+  acked_message_id: string | null
+  note: string | null
+}
+
+export interface ProofOfCoordination {
+  file: string
+  agent: string
+  creator: string
+  created_at: number
+  consensus_at: number
+  finality_ms: number
+  event_hash: string
+  transactions: WireMessage[]
+  content_hash: string
+}
+
+export interface VerifyResult {
+  valid: boolean
+  proof: ProofOfCoordination
+  error?: string
+}
+
+export interface EventLogEntry {
+  ts: number
+  tag: string
+  label: string
+  message: string
+}
+
+export interface NodeInfo {
+  label: string
+  bind: string
+  role: string | null
+  status: 'running' | 'stopped'
+}
