@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Terminal, ArrowDown, ChevronsUpDown } from 'lucide-react'
+import { Terminal, ArrowDown, ChevronsUpDown, Trash2, Download } from 'lucide-react'
 import type { EventLogEntry } from '@/types'
 
 const ROW_HEIGHT = 22
@@ -17,11 +17,12 @@ const TAG_COLORS: Record<string, string> = {
   HEARTBEAT: 'bg-green-500',
   STATE: 'bg-amber-500',
   ACTION: 'bg-orange-500',
-  ACK: 'bg-purple-500',
-  STALE: 'bg-red-500',
-  RECOVERY: 'bg-emerald-500',
   PROOF: 'bg-indigo-500',
   EXIT: 'bg-gray-500',
+  CRASH: 'bg-red-600',
+  VERTEX_TX: 'bg-teal-500',
+  VERTEX_RX: 'bg-sky-500',
+  VERTEX_ERR: 'bg-red-700',
   CMD: 'bg-pink-500',
 }
 
@@ -41,11 +42,11 @@ function formatTs(ts: number): string {
   return `${h}:${m}:${s}.${ms}`
 }
 
-export function EventLog({ events: rawEvents }: { events: EventLogEntry[] }) {
-  const events = useMemo(() => rawEvents.filter(e => e.tag !== 'HEARTBEAT'), [rawEvents])
+export function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry[], onClear?: () => void }) {
+  const events = useMemo(() => rawEvents.filter(e => e.tag !== 'HEARTBEAT' && e.tag !== 'VERTEX_RX' && e.tag !== 'VERTEX_TX'), [rawEvents])
   const containerRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   const [scrollTop, setScrollTop] = useState(0)
   const [containerHeight, setContainerHeight] = useState(COLLAPSED_ROWS * ROW_HEIGHT)
 
@@ -100,15 +101,46 @@ export function EventLog({ events: rawEvents }: { events: EventLogEntry[] }) {
           <Terminal className="h-5 w-5" />
           Live Event Log
           <Badge variant="secondary">{events.length}</Badge>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto h-6 px-2"
-            onClick={() => setExpanded(e => !e)}
-          >
-            <ChevronsUpDown className="h-3 w-3 mr-1" />
-            {expanded ? 'Collapse' : 'Expand'}
-          </Button>
+          <div className="ml-auto flex items-center gap-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2"
+              onClick={() => {
+                const lines = events.map(e => `${new Date(e.ts).toISOString()}\t${e.tag}\t${e.label}\t${e.message}`)
+                const blob = new Blob([lines.join('\n')], { type: 'text/plain' })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = `vertex-events-${Date.now()}.log`
+                a.click()
+                URL.revokeObjectURL(url)
+              }}
+            >
+              <Download className="h-3 w-3 mr-1" />
+              Download
+            </Button>
+            {onClear && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2"
+                onClick={onClear}
+              >
+                <Trash2 className="h-3 w-3 mr-1" />
+                Clear
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-6 px-2"
+              onClick={() => setExpanded(e => !e)}
+            >
+              <ChevronsUpDown className="h-3 w-3 mr-1" />
+              {expanded ? 'Collapse' : 'Expand'}
+            </Button>
+          </div>
         </CardTitle>
       </CardHeader>
       <CardContent>

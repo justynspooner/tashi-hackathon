@@ -1,7 +1,22 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { AgentState, EventLogEntry, NodeInfo, ProofOfCoordination } from '../types'
 
-const MAX_LOG_ENTRIES = 500
+const MAX_LOG_ENTRIES = 5000
+const EVENT_LOG_STORAGE_KEY = 'vertex-event-log'
+
+function loadCachedEvents(): EventLogEntry[] {
+  try {
+    const raw = sessionStorage.getItem(EVENT_LOG_STORAGE_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch { /* ignore */ }
+  return []
+}
+
+function saveCachedEvents(events: EventLogEntry[]) {
+  try {
+    sessionStorage.setItem(EVENT_LOG_STORAGE_KEY, JSON.stringify(events))
+  } catch { /* storage full — silently drop */ }
+}
 
 export function useAgentStates() {
   const [states, setStates] = useState<AgentState[]>([])
@@ -36,15 +51,23 @@ export function useProofs() {
 }
 
 export function useEventLog() {
-  const [events, setEvents] = useState<EventLogEntry[]>([])
+  const [events, setEvents] = useState<EventLogEntry[]>(loadCachedEvents)
 
-  // Fetch tail once on mount
+  // Merge server tail with cached events on mount
   useEffect(() => {
     async function fetchTail() {
       try {
         const res = await fetch('/api/event-log?tail=200')
-        const data: EventLogEntry[] = await res.json()
-        setEvents(data.slice(-MAX_LOG_ENTRIES))
+        const serverEvents: EventLogEntry[] = await res.json()
+        setEvents(prev => {
+          // Merge: use cached events as base, append any server events newer than our latest
+          const lastTs = prev.length > 0 ? prev[prev.length - 1].ts : 0
+          const newer = serverEvents.filter(e => e.ts > lastTs)
+          const merged = [...prev, ...newer]
+          const trimmed = merged.length > MAX_LOG_ENTRIES ? merged.slice(-MAX_LOG_ENTRIES) : merged
+          saveCachedEvents(trimmed)
+          return trimmed
+        })
       } catch { /* server not ready */ }
     }
     fetchTail()
@@ -57,11 +80,16 @@ export function useEventLog() {
         return prev
       }
       const next = [...prev, entry]
-      return next.length > MAX_LOG_ENTRIES ? next.slice(-MAX_LOG_ENTRIES) : next
+      const trimmed = next.length > MAX_LOG_ENTRIES ? next.slice(-MAX_LOG_ENTRIES) : next
+      saveCachedEvents(trimmed)
+      return trimmed
     })
   }, [])
 
-  const clearEvents = useCallback(() => setEvents([]), [])
+  const clearEvents = useCallback(() => {
+    setEvents([])
+    saveCachedEvents([])
+  }, [])
 
   return { events, appendEvent, clearEvents }
 }
@@ -98,7 +126,21 @@ export function useNodes() {
     await fetchNodes()
   }, [fetchNodes])
 
-  return { nodes, startNode, stopNode, setRole, refetch: fetchNodes }
+  const createSwarm = useCallback(async (count: number) => {
+    await fetch('/api/swarm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count }),
+    })
+    await fetchNodes()
+  }, [fetchNodes])
+
+  const destroySwarm = useCallback(async () => {
+    await fetch('/api/swarm', { method: 'DELETE' })
+    await fetchNodes()
+  }, [fetchNodes])
+
+  return { nodes, startNode, stopNode, setRole, createSwarm, destroySwarm, refetch: fetchNodes }
 }
 
 export function useSSE(callbacks?: {
@@ -121,7 +163,7 @@ export function useSSE(callbacks?: {
         callbacksRef.current.onEventLog(data.entry)
       } else if (data.type === 'update' && callbacksRef.current?.onUpdate) {
         callbacksRef.current.onUpdate()
-      } else if (data.type === 'node_status' && callbacksRef.current?.onNodeStatus) {
+      } else if ((data.type === 'node_status' || data.type === 'node_added' || data.type === 'swarm_created' || data.type === 'swarm_destroyed') && callbacksRef.current?.onNodeStatus) {
         callbacksRef.current.onNodeStatus()
       }
     }

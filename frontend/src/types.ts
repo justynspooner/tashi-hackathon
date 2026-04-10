@@ -9,14 +9,9 @@ export interface AgentState {
   file: string
   label: string
   local: SharedState
-  peer: SharedState | null
+  peers: Record<string, SharedState>
   last_message_kind: string
   last_message_id: string
-  pending_role_change: {
-    message_id: string
-    sent_at_ms: number
-    role: string
-  } | null
 }
 
 export interface WireMessage {
@@ -24,7 +19,6 @@ export interface WireMessage {
   message_id: string
   sent_at_ms: number
   state: SharedState
-  acked_message_id: string | null
   note: string | null
 }
 

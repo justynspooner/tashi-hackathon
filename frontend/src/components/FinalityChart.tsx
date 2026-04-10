@@ -1,28 +1,21 @@
 import { useMemo } from 'react'
-import { Bar, BarChart, XAxis, YAxis, Tooltip, Cell } from 'recharts'
+import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { ChartContainer, type ChartConfig } from '@/components/ui/chart'
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from '@/components/ui/chart'
 import { Timer } from 'lucide-react'
-import { kindClass } from '@/lib/utils'
 import type { ProofOfCoordination } from '@/types'
 
 const chartConfig = {
   finality: {
     label: 'Finality (ms)',
-    color: 'var(--color-chart-1)',
+    color: 'var(--chart-1)',
   },
 } satisfies ChartConfig
-
-function barColor(kind: string) {
-  const cls = kindClass(kind)
-  switch (cls) {
-    case 'bg-blue-500': return '#3b82f6'
-    case 'bg-green-500': return '#22c55e'
-    case 'bg-amber-500': return '#f59e0b'
-    case 'bg-purple-500': return '#a855f7'
-    default: return '#6b7280'
-  }
-}
 
 interface DataPoint {
   label: string
@@ -34,7 +27,6 @@ interface DataPoint {
 export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
   const data = useMemo(() => {
     const points: DataPoint[] = []
-    // Sort proofs by consensus time ascending
     const sorted = [...proofs].sort((a, b) => a.consensus_at - b.consensus_at)
     for (const proof of sorted) {
       const kind = proof.transactions[0]?.kind ?? 'unknown'
@@ -67,7 +59,8 @@ export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
       </CardHeader>
       <CardContent className="px-4 pb-3 pt-0">
         <ChartContainer config={chartConfig} className="h-[120px] w-full">
-          <BarChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+          <AreaChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+            <CartesianGrid vertical={false} />
             <XAxis
               dataKey="label"
               tickLine={false}
@@ -81,24 +74,36 @@ export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
               width={40}
               tickFormatter={(v) => `${v}ms`}
             />
-            <Tooltip
-              content={({ active, payload }) => {
-                if (!active || !payload?.length) return null
-                const d = payload[0].payload as DataPoint
-                return (
-                  <div className="rounded-md border bg-background px-3 py-2 text-xs shadow-sm">
-                    <div className="font-medium">{d.agent} &middot; {d.kind}</div>
-                    <div className="text-muted-foreground">{d.finality}ms finality</div>
-                  </div>
-                )
-              }}
+            <ChartTooltip
+              cursor={false}
+              content={
+                <ChartTooltipContent
+                  formatter={(_value, _name, item) => {
+                    const d = item.payload as DataPoint
+                    return (
+                      <div className="text-xs">
+                        <div className="font-medium">{d.agent} &middot; {d.kind}</div>
+                        <div className="text-muted-foreground">{d.finality}ms finality</div>
+                      </div>
+                    )
+                  }}
+                />
+              }
             />
-            <Bar dataKey="finality" radius={[3, 3, 0, 0]}>
-              {data.map((d, i) => (
-                <Cell key={i} fill={barColor(d.kind)} />
-              ))}
-            </Bar>
-          </BarChart>
+            <defs>
+              <linearGradient id="fillFinality" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="var(--color-finality)" stopOpacity={0.8} />
+                <stop offset="95%" stopColor="var(--color-finality)" stopOpacity={0.1} />
+              </linearGradient>
+            </defs>
+            <Area
+              dataKey="finality"
+              type="linear"
+              fill="url(#fillFinality)"
+              fillOpacity={0.4}
+              stroke="var(--color-finality)"
+            />
+          </AreaChart>
         </ChartContainer>
       </CardContent>
     </Card>

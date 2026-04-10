@@ -14,7 +14,6 @@ pub enum MessageKind {
     Hello,
     Heartbeat,
     StateUpdate,
-    StateAck,
 }
 
 impl MessageKind {
@@ -23,7 +22,6 @@ impl MessageKind {
             Self::Hello => "hello",
             Self::Heartbeat => "heartbeat",
             Self::StateUpdate => "state_update",
-            Self::StateAck => "state_ack",
         }
     }
 }
@@ -34,13 +32,5 @@ pub struct WireMessage {
     pub message_id: String,
     pub sent_at_ms: u64,
     pub state: SharedState,
-    pub acked_message_id: Option<String>,
     pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingRoleChange {
-    pub message_id: String,
-    pub sent_at_ms: u64,
-    pub role: String,
 }

@@ -47,7 +47,6 @@ export function kindBadgeVariant(kind: string) {
   switch (kind) {
     case 'hello': return 'default' as const
     case 'state_update': return 'default' as const
-    case 'state_ack': return 'outline' as const
     default: return 'secondary' as const
   }
 }
@@ -57,7 +56,6 @@ export function kindClass(kind: string) {
     case 'hello': return 'bg-blue-500'
     case 'heartbeat': return 'bg-green-500'
     case 'state_update': return 'bg-amber-500'
-    case 'state_ack': return 'bg-purple-500'
     default: return 'bg-gray-500'
   }
 }
@@ -67,7 +65,6 @@ export function kindIcon(kind: string) {
     case 'hello': return 'H'
     case 'heartbeat': return 'HB'
     case 'state_update': return 'SU'
-    case 'state_ack': return 'SA'
     default: return '?'
   }
 }

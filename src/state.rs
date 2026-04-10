@@ -1,8 +1,9 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -10,19 +11,19 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::proof::ProofOfCoordination;
-use crate::protocol::{MessageKind, PendingRoleChange, SharedState, WireMessage};
+use crate::protocol::{MessageKind, SharedState, WireMessage};
 
 // --- Cross-thread channel types ---
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum WebEvent {
     StateChanged {
         label: String,
         local: SharedState,
-        peer: Option<SharedState>,
+        peers: HashMap<String, SharedState>,
         last_message_kind: Option<String>,
         last_message_id: Option<String>,
-        pending_role_change: Option<PendingRoleChange>,
     },
     LogEntry {
         ts: u64,
@@ -42,29 +43,35 @@ pub enum WebEvent {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum NodeCommand {
     SetRole(String),
 }
 
-pub type SharedRuntime = Rc<RefCell<RuntimeState>>;
+pub type SharedRuntime = Arc<Mutex<RuntimeState>>;
+
+pub fn short_peer_id(peer_id: &str) -> String {
+    let suffix_len = peer_id.len().min(8);
+    format!("...{}", &peer_id[peer_id.len().saturating_sub(suffix_len)..])
+}
+
+/// Per-peer tracking information.
+pub struct PeerInfo {
+    pub state: Option<SharedState>,
+    pub discovery_logged: bool,
+    pub handshake_logged: bool,
+}
 
 pub struct RuntimeState {
     pub label: String,
     pub local: SharedState,
-    pub peer: Option<SharedState>,
+    pub peers: HashMap<String, PeerInfo>,
     pub local_public_key: String,
-    pub expected_peer_id: String,
-    pub peer_control_addr: String,
     pub last_message_kind: Option<MessageKind>,
     pub last_message_id: Option<String>,
     pub next_message_seq: u64,
-    pub pending_role_change: Option<PendingRoleChange>,
     pub state_file: Option<PathBuf>,
     pub sync_points_seen: u64,
-    pub discovery_logged: bool,
-    pub handshake_logged: bool,
-    pub last_peer_contact_ms: Option<u64>,
-    pub stale_logged: bool,
     pub auto_toggle_done: bool,
     pub cmd_file: Option<PathBuf>,
 }
@@ -73,8 +80,7 @@ impl RuntimeState {
     pub fn new(
         label: String,
         local_public_key: String,
-        expected_peer_id: String,
-        peer_control_addr: String,
+        peers: HashMap<String, PeerInfo>,
         role: String,
         status: String,
         state_file: Option<PathBuf>,
@@ -88,20 +94,13 @@ impl RuntimeState {
                 role,
                 status,
             },
-            peer: None,
+            peers,
             local_public_key,
-            expected_peer_id,
-            peer_control_addr,
             last_message_kind: None,
             last_message_id: None,
             next_message_seq: 1,
-            pending_role_change: None,
             state_file,
             sync_points_seen: 0,
-            discovery_logged: false,
-            handshake_logged: false,
-            last_peer_contact_ms: None,
-            stale_logged: false,
             auto_toggle_done: false,
             cmd_file,
         }
@@ -112,36 +111,28 @@ impl RuntimeState {
         self.next_message_seq += 1;
         id
     }
+
+    /// Build a map of peer_id -> SharedState for peers we've heard from.
+    pub fn peer_states(&self) -> HashMap<String, SharedState> {
+        self.peers
+            .iter()
+            .filter_map(|(id, info)| info.state.as_ref().map(|s| (id.clone(), s.clone())))
+            .collect()
+    }
 }
 
 pub fn update_peer_state(state: &mut RuntimeState, wire: &WireMessage) {
-    let now = now_ms();
+    let peer_id = &wire.state.peer_id;
     let label = state.label.clone();
-    let peer_short = &wire.state.peer_id[..12.min(wire.state.peer_id.len())];
+    let peer_short = short_peer_id(peer_id);
 
-    let was_stale = state
-        .peer
-        .as_ref()
-        .map(|p| p.status == "stale")
-        .unwrap_or(false);
+    if let Some(peer_info) = state.peers.get_mut(peer_id) {
+        peer_info.state = Some(wire.state.clone());
 
-    state.peer = Some(wire.state.clone());
-    state.last_peer_contact_ms = Some(now);
-    state.stale_logged = false;
-    state.last_message_kind = Some(wire.kind.clone());
-    state.last_message_id = Some(wire.message_id.clone());
-
-    if !state.discovery_logged {
-        state.discovery_logged = true;
-        log("DISCOVERY", &label, format!("discovered peer {peer_short}"));
-    }
-
-    if was_stale {
-        log(
-            "RECOVERY",
-            &label,
-            format!("peer {peer_short} resumed after stale period"),
-        );
+        if !peer_info.discovery_logged {
+            peer_info.discovery_logged = true;
+            log("DISCOVERY", &label, format!("discovered peer {peer_short}"));
+        }
     }
 }
 
@@ -149,10 +140,9 @@ pub fn update_peer_state(state: &mut RuntimeState, wire: &WireMessage) {
 struct PersistedState<'a> {
     label: &'a str,
     local: &'a SharedState,
-    peer: &'a Option<SharedState>,
+    peers: HashMap<&'a str, &'a SharedState>,
     last_message_kind: Option<&'a str>,
     last_message_id: Option<&'a str>,
-    pending_role_change: &'a Option<PendingRoleChange>,
 }
 
 pub fn persist_state(state: &RuntimeState) -> anyhow::Result<()> {
@@ -165,13 +155,18 @@ pub fn persist_state(state: &RuntimeState) -> anyhow::Result<()> {
             .with_context(|| format!("failed to create state directory {}", parent.display()))?;
     }
 
+    let peers: HashMap<&str, &SharedState> = state
+        .peers
+        .iter()
+        .filter_map(|(id, info)| info.state.as_ref().map(|s| (id.as_str(), s)))
+        .collect();
+
     let snapshot = PersistedState {
         label: &state.label,
         local: &state.local,
-        peer: &state.peer,
+        peers,
         last_message_kind: state.last_message_kind.as_ref().map(MessageKind::as_str),
         last_message_id: state.last_message_id.as_deref(),
-        pending_role_change: &state.pending_role_change,
     };
 
     let json = serde_json::to_vec_pretty(&snapshot)?;
@@ -180,10 +175,9 @@ pub fn persist_state(state: &RuntimeState) -> anyhow::Result<()> {
     send_web_event(WebEvent::StateChanged {
         label: state.label.clone(),
         local: state.local.clone(),
-        peer: state.peer.clone(),
+        peers: state.peer_states(),
         last_message_kind: state.last_message_kind.as_ref().map(|k| k.as_str().to_string()),
         last_message_id: state.last_message_id.clone(),
-        pending_role_change: state.pending_role_change.clone(),
     });
 
     Ok(())

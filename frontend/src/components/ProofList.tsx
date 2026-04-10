@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import React, { useState } from 'react'
 import {
   Table,
   TableBody,
@@ -96,9 +96,8 @@ export function ProofList({ proofs }: { proofs: ProofOfCoordination[] }) {
                   const isExpanded = expanded === key
                   const result = verifyResults[key]
                   return (
-                    <>
+                    <React.Fragment key={key}>
                       <TableRow
-                        key={key}
                         className="cursor-pointer"
                         onClick={() => setExpanded(isExpanded ? null : key)}
                       >
@@ -152,7 +151,7 @@ export function ProofList({ proofs }: { proofs: ProofOfCoordination[] }) {
                           </TableCell>
                         </TableRow>
                       )}
-                    </>
+                    </React.Fragment>
                   )
                 })}
               </TableBody>

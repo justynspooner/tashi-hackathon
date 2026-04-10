@@ -28,16 +28,18 @@ enum Command {
         #[arg(long)]
         proof_file: PathBuf,
     },
-    /// Run a node and connect to a peer.
+    /// Run a node and connect to peers.
     Run {
         #[arg(long)]
         bind: String,
         #[arg(long)]
         secret: String,
+        /// Peer addresses (repeat for multiple peers).
         #[arg(long)]
-        peer_addr: String,
+        peer_addr: Vec<String>,
+        /// Peer public keys (repeat for multiple peers, same order as --peer-addr).
         #[arg(long)]
-        peer_pubkey: String,
+        peer_pubkey: Vec<String>,
         #[arg(long, default_value = "agent")]
         label: String,
         #[arg(long, default_value = "carrier")]
@@ -60,6 +62,9 @@ enum Command {
         event_log: Option<PathBuf>,
         #[arg(long)]
         cmd_file: Option<PathBuf>,
+        /// Signal that this node is joining an already-running session (reconnect).
+        #[arg(long)]
+        joining: bool,
     },
     /// Start the web server and manage nodes from the browser.
     Serve {
@@ -69,7 +74,7 @@ enum Command {
     },
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -104,7 +109,17 @@ async fn main() -> anyhow::Result<()> {
             proof_dir,
             event_log,
             cmd_file,
+            joining,
         } => {
+            anyhow::ensure!(
+                peer_addr.len() == peer_pubkey.len(),
+                "Must have equal number of --peer-addr and --peer-pubkey arguments"
+            );
+            let peers: Vec<(String, String)> = peer_addr
+                .into_iter()
+                .zip(peer_pubkey.into_iter())
+                .collect();
+
             let state_file = state_file
                 .unwrap_or_else(|| PathBuf::from(format!("artifacts/{label}-state.json")));
             let proof_dir = proof_dir
@@ -117,8 +132,7 @@ async fn main() -> anyhow::Result<()> {
             node::run(
                 bind,
                 secret,
-                peer_addr,
-                peer_pubkey,
+                peers,
                 label,
                 role,
                 status,
@@ -132,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(cmd_file),
                 None,
                 None,
+                joining,
             )
             .await?;
         }
