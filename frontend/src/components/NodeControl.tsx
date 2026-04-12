@@ -1,5 +1,5 @@
 import { memo, useState, useRef, useEffect, useMemo, useCallback } from 'react'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -120,6 +120,7 @@ const NodeCard = memo(function NodeCard({
   events,
   loading,
   peerIdToLabel,
+  now,
   onStart,
   onStop,
   onSetRole,
@@ -129,6 +130,7 @@ const NodeCard = memo(function NodeCard({
   events: EventLogEntry[]
   loading: boolean
   peerIdToLabel: Record<string, string>
+  now: number
   onStart: (label: string) => void
   onStop: (label: string) => void
   onSetRole: (label: string, role: string) => void
@@ -175,7 +177,7 @@ const NodeCard = memo(function NodeCard({
         {agentState && (
           <div className="text-[10px] border-t pt-1 space-y-0.5">
             {agentState.peers && Object.entries(agentState.peers).sort(([, a], [, b]) => (peerIdToLabel[a.peer_id] ?? a.peer_id).localeCompare(peerIdToLabel[b.peer_id] ?? b.peer_id)).map(([peerId, peer]) => {
-              const isStale = Date.now() - peer.last_seen_ms > 15_000
+              const isStale = now - peer.last_seen_ms > 15_000
               return (
                 <div key={peerId} className={`flex items-center gap-1 ${isStale ? 'opacity-50' : ''}`}>
                   <span className="text-muted-foreground w-12 shrink-0 truncate">{peerIdToLabel[peer.peer_id] ?? shortId(peer.peer_id)}</span>
@@ -219,6 +221,12 @@ export const NodeControl = memo(function NodeControl({ nodes, states, events, on
   const [swarmSizeInput, setSwarmSizeInput] = useState('7')
   const [swarmDialogOpen, setSwarmDialogOpen] = useState(false)
   const [destroyDialogOpen, setDestroyDialogOpen] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 5000)
+    return () => clearInterval(id)
+  }, [])
 
   // Filter events per node (exclude noisy tags)
   const eventsByNode = useMemo(() => {
@@ -367,6 +375,7 @@ export const NodeControl = memo(function NodeControl({ nodes, states, events, on
               events={eventsByNode[node.label] ?? []}
               loading={!!loading[node.label]}
               peerIdToLabel={peerIdToLabel}
+              now={now}
               onStart={handleStart}
               onStop={handleStop}
               onSetRole={onSetRole}

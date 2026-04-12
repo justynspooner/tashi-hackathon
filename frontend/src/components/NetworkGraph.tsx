@@ -88,7 +88,6 @@ export const NetworkGraph = memo(function NetworkGraph({ states, events, nodes, 
     }
 
     const labels = currentTopo.split(',')
-    const oldPositions = layoutRef.current
 
     // Fixed circular layout — ensures no edges overlap
     const cx = VW / 2

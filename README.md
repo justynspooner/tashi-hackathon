@@ -16,6 +16,12 @@ A live coordination explorer built on the [Tashi Vertex](https://github.com/tash
 cargo run -- serve
 ```
 
+If you want to be able to sever connections between nodes, you'll need to run in sudo (MacOS only).
+
+```sh
+sudo cargo run -- serve
+```
+
 **Terminal 2 — Frontend dev server:**
 
 ```sh
@@ -89,36 +95,36 @@ cargo run -- verify --proof-file artifacts/proofs/agent-a/proof-0.json
 
 ## API endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/events` | SSE stream of real-time events |
-| GET | `/api/state` | Current agent states (local + peers) |
-| GET | `/api/proofs` | List all proofs |
-| GET | `/api/event-log` | Tail event log (optional `?limit=`) |
-| GET | `/api/proofs/:agent/:file/verify` | Verify a specific proof |
-| GET | `/api/nodes` | List configured nodes and status |
-| POST | `/api/nodes/:label/start` | Start a node |
-| POST | `/api/nodes/:label/stop` | Stop a node |
-| POST | `/api/nodes/:label/role` | Change a node's role |
-| POST | `/api/swarm` | Create multiple nodes at once |
-| DELETE | `/api/swarm` | Destroy all swarm nodes |
-| GET | `/api/partitions` | List active network partitions |
-| POST | `/api/partitions/create` | Create a partition between nodes |
-| POST | `/api/partitions/heal` | Heal a partition |
-| POST | `/api/clear-artifacts` | Reset all artifacts |
+| Method | Path                              | Description                          |
+| ------ | --------------------------------- | ------------------------------------ |
+| GET    | `/api/events`                     | SSE stream of real-time events       |
+| GET    | `/api/state`                      | Current agent states (local + peers) |
+| GET    | `/api/proofs`                     | List all proofs                      |
+| GET    | `/api/event-log`                  | Tail event log (optional `?limit=`)  |
+| GET    | `/api/proofs/:agent/:file/verify` | Verify a specific proof              |
+| GET    | `/api/nodes`                      | List configured nodes and status     |
+| POST   | `/api/nodes/:label/start`         | Start a node                         |
+| POST   | `/api/nodes/:label/stop`          | Stop a node                          |
+| POST   | `/api/nodes/:label/role`          | Change a node's role                 |
+| POST   | `/api/swarm`                      | Create multiple nodes at once        |
+| DELETE | `/api/swarm`                      | Destroy all swarm nodes              |
+| GET    | `/api/partitions`                 | List active network partitions       |
+| POST   | `/api/partitions/create`          | Create a partition between nodes     |
+| POST   | `/api/partitions/heal`            | Heal a partition                     |
+| POST   | `/api/clear-artifacts`            | Reset all artifacts                  |
 
 ## Event tags
 
-| Tag | Meaning |
-|-----|---------|
-| `DISCOVERY` | Peer session becomes visible |
-| `HANDSHAKE` | Signed `HELLO` sent/verified via Vertex consensus |
+| Tag         | Meaning                                             |
+| ----------- | --------------------------------------------------- |
+| `DISCOVERY` | Peer session becomes visible                        |
+| `HANDSHAKE` | Signed `HELLO` sent/verified via Vertex consensus   |
 | `HEARTBEAT` | Ongoing liveness traffic on the UDP control channel |
-| `STATE` | Peer mirroring a role change |
-| `ACK` | Acknowledgement of a state change |
-| `STALE` | Peer marked stale after 10s without traffic |
-| `RECOVERY` | Automatic resume when a stale peer returns |
-| `PROOF` | Proof-of-coordination file written |
+| `STATE`     | Peer mirroring a role change                        |
+| `ACK`       | Acknowledgement of a state change                   |
+| `STALE`     | Peer marked stale after 10s without traffic         |
+| `RECOVERY`  | Automatic resume when a stale peer returns          |
+| `PROOF`     | Proof-of-coordination file written                  |
 
 ## Proof of coordination
 

@@ -33,7 +33,7 @@ function saveCachedEvents(events: EventLogEntry[]) {
 function useThrottledCallback<T extends (...args: unknown[]) => void>(fn: T, delayMs: number): T {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fnRef = useRef(fn)
-  fnRef.current = fn
+  useEffect(() => { fnRef.current = fn })
 
   const throttled = useCallback((...args: unknown[]) => {
     if (timerRef.current) return
@@ -55,7 +55,14 @@ export function useAgentStates() {
   }, [])
 
   // Fetch once on mount; SSE drives updates after that
-  useEffect(() => { fetchStates() }, [fetchStates])
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/state')
+      .then(res => res.json())
+      .then(data => { if (!cancelled) setStates(data) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   return { states, refetch: fetchStates }
 }
@@ -71,7 +78,14 @@ export function useProofs() {
   }, [])
 
   // Fetch once on mount; SSE drives updates after that
-  useEffect(() => { fetchProofs() }, [fetchProofs])
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/proofs')
+      .then(res => res.json())
+      .then(data => { if (!cancelled) setProofs(data) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   return { proofs, refetch: fetchProofs }
 }
@@ -151,7 +165,14 @@ export function useNodes() {
   }, [])
 
   // Fetch once on mount; SSE drives updates after that
-  useEffect(() => { fetchNodes() }, [fetchNodes])
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/nodes')
+      .then(res => res.json())
+      .then(data => { if (!cancelled) setNodes(data) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   const startNode = useCallback(async (label: string) => {
     await fetch(`/api/nodes/${label}/start`, { method: 'POST' })
@@ -200,7 +221,14 @@ export function usePartitions() {
     } catch { /* server not ready */ }
   }, [])
 
-  useEffect(() => { fetchPartitions() }, [fetchPartitions])
+  useEffect(() => {
+    let cancelled = false
+    fetch('/api/partitions')
+      .then(res => res.json())
+      .then(data => { if (!cancelled) setPartitions(data.partitions ?? []) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
 
   const togglePartition = useCallback(async (nodeA: string, nodeB: string) => {
     const sorted = [nodeA, nodeB].sort()
@@ -234,7 +262,7 @@ export function useSSE(callbacks?: {
 }) {
   const [connected, setConnected] = useState(false)
   const callbacksRef = useRef(callbacks)
-  callbacksRef.current = callbacks
+  useEffect(() => { callbacksRef.current = callbacks })
 
   // Throttle bulk-refetch callbacks so rapid SSE bursts don't cascade
   const throttledUpdate = useThrottledCallback(() => {
