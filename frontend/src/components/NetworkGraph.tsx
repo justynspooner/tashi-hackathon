@@ -5,13 +5,15 @@ import { Network } from 'lucide-react'
 import { roleHex, roleColor } from '@/lib/utils'
 import type { AgentState, EventLogEntry, NodeInfo } from '@/types'
 
-const VW = 800
+const VW = 600
 const VH = 500
 
 interface Props {
   states: AgentState[]
   events: EventLogEntry[]
   nodes: NodeInfo[]
+  partitions?: [string, string][]
+  onTogglePartition?: (a: string, b: string) => void
 }
 
 type Liveness = 'online' | 'offline'
@@ -45,7 +47,7 @@ function topoKey(nodes: NodeInfo[], states: AgentState[]): string {
   return labels.sort().join(',') || ''
 }
 
-export function NetworkGraph({ states, events, nodes }: Props) {
+export function NetworkGraph({ states, events, nodes, partitions = [], onTogglePartition }: Props) {
   const svgRef = useRef<SVGSVGElement>(null)
   const lastEventCount = useRef(0)
   const layoutRef = useRef<Map<string, { x: number; y: number }>>(new Map())
@@ -57,12 +59,16 @@ export function NetworkGraph({ states, events, nodes }: Props) {
   // Stable refs for state/nodes so the tick callback doesn't cause stale closures
   const statesRef = useRef(states)
   const nodesRef = useRef(nodes)
+  const partitionsRef = useRef(partitions)
+  const onToggleRef = useRef(onTogglePartition)
   statesRef.current = states
   nodesRef.current = nodes
+  partitionsRef.current = partitions
+  onToggleRef.current = onTogglePartition
 
   // 1) Force layout — rebuild when topology changes
   useEffect(() => {
-    if (currentTopo === prevTopoKey.current || !currentTopo) return
+    if (currentTopo === prevTopoKey.current) return
     prevTopoKey.current = currentTopo
 
     const svgEl = svgRef.current
@@ -76,16 +82,23 @@ export function NetworkGraph({ states, events, nodes }: Props) {
     svg.selectAll('*').remove()
     svg.attr('viewBox', `0 0 ${VW} ${VH}`).attr('preserveAspectRatio', 'xMidYMid meet')
 
+    if (!currentTopo) {
+      layoutRef.current.clear()
+      return
+    }
+
     const labels = currentTopo.split(',')
     const oldPositions = layoutRef.current
 
-    // Build simulation nodes, preserving old positions
+    // Fixed circular layout — ensures no edges overlap
+    const cx = VW / 2
+    const cy = VH / 2
+    const radius = Math.min(cx, cy) - 80
     const simNodes: SimNode[] = labels.map((id, i) => {
-      const old = oldPositions.get(id)
-      if (old) return { id, x: old.x, y: old.y }
-      // New node: start near center with slight offset
-      const angle = (2 * Math.PI * i) / labels.length
-      return { id, x: VW / 2 + Math.cos(angle) * 50, y: VH / 2 + Math.sin(angle) * 50 }
+      const angle = (2 * Math.PI * i) / labels.length - Math.PI / 2
+      const x = cx + Math.cos(angle) * radius
+      const y = cy + Math.sin(angle) * radius
+      return { id, x, y }
     })
 
     // Build links for all pairs
@@ -114,6 +127,29 @@ export function NetworkGraph({ states, events, nodes }: Props) {
         .attr('stroke-opacity', 0.1)
         .attr('stroke-width', 2)
         .attr('stroke-dasharray', '6,4')
+
+      // Invisible wider click target
+      const [labelA, labelB] = link.id.split('--')
+      edgesLayer.append('line')
+        .attr('class', `edge-hit-${link.id}`)
+        .attr('stroke', 'transparent')
+        .attr('stroke-width', 14)
+        .attr('cursor', 'pointer')
+        .on('click', () => {
+          onToggleRef.current?.(labelA, labelB)
+        })
+    }
+
+    // Partition indicator icons (scissors) at edge midpoints
+    for (const link of simLinks) {
+      edgesLayer.append('text')
+        .attr('class', `edge-icon-${link.id}`)
+        .attr('text-anchor', 'middle')
+        .attr('dominant-baseline', 'central')
+        .attr('font-size', '16')
+        .attr('opacity', 0)
+        .attr('pointer-events', 'none')
+        .text('\u{2702}')
     }
 
     // Create node groups
@@ -165,45 +201,27 @@ export function NetworkGraph({ states, events, nodes }: Props) {
         .attr('stroke', 'var(--background)').attr('stroke-width', 2)
     }
 
-    // Create force simulation
-    const linkDistance = Math.max(120, Math.min(200, 600 / labels.length))
-    const simulation = d3.forceSimulation<SimNode>(simNodes)
-      .force('link', d3.forceLink<SimNode, SimLink>(simLinks).id(d => d.id).distance(linkDistance))
-      .force('charge', d3.forceManyBody().strength(-500))
-      .force('center', d3.forceCenter(VW / 2, VH / 2))
-      .force('collision', d3.forceCollide(60))
-      .force('x', d3.forceX(VW / 2).strength(0.05))
-      .force('y', d3.forceY(VH / 2).strength(0.05))
-      .alpha(0.8)
-      .alphaDecay(0.02)
+    // Set fixed positions immediately
+    const positions = layoutRef.current
+    for (const node of simNodes) {
+      positions.set(node.id, { x: node.x!, y: node.y! })
+      svg.select(`.node-group-${node.id}`)
+        .attr('transform', `translate(${node.x},${node.y})`)
+    }
 
-    simulation.on('tick', () => {
-      const positions = layoutRef.current
-
-      // Update node positions
-      for (const node of simNodes) {
-        const x = Math.max(60, Math.min(VW - 60, node.x!))
-        const y = Math.max(60, Math.min(VH - 80, node.y!))
-        node.x = x
-        node.y = y
-        positions.set(node.id, { x, y })
-        svg.select(`.node-group-${node.id}`)
-          .attr('transform', `translate(${x},${y})`)
-      }
-
-      // Update edge positions
-      for (const link of simLinks) {
-        const s = link.source as SimNode
-        const t = link.target as SimNode
-        svg.select(`.edge-${link.id}`)
-          .attr('x1', s.x!).attr('y1', s.y!)
-          .attr('x2', t.x!).attr('y2', t.y!)
-      }
-    })
-
-    simulationRef.current = simulation
-
-    return () => { simulation.stop() }
+    for (const link of simLinks) {
+      const s = simNodes.find(n => n.id === (typeof link.source === 'string' ? link.source : (link.source as SimNode).id))!
+      const t = simNodes.find(n => n.id === (typeof link.target === 'string' ? link.target : (link.target as SimNode).id))!
+      svg.select(`.edge-${link.id}`)
+        .attr('x1', s.x!).attr('y1', s.y!)
+        .attr('x2', t.x!).attr('y2', t.y!)
+      svg.select(`.edge-hit-${link.id}`)
+        .attr('x1', s.x!).attr('y1', s.y!)
+        .attr('x2', t.x!).attr('y2', t.y!)
+      svg.select(`.edge-icon-${link.id}`)
+        .attr('x', (s.x! + t.x!) / 2)
+        .attr('y', (s.y! + t.y!) / 2)
+    }
   }, [currentTopo])
 
   // 2) Update visual properties when state changes
@@ -263,16 +281,38 @@ export function NetworkGraph({ states, events, nodes }: Props) {
           const livenessB = determineLiveness(labels[j], states, nodes)
           const bothOnline = livenessA === 'online' && livenessB === 'online'
           const edgeId = [labels[i], labels[j]].sort().join('--')
+          const sorted = [labels[i], labels[j]].sort()
+          const isPartitioned = partitions.some(p =>
+            [p[0], p[1]].sort().join() === sorted.join()
+          )
 
-          svg.select(`.edge-${edgeId}`)
-            .transition().duration(600)
-            .attr('stroke', bothOnline ? '#22c55e' : 'currentColor')
-            .attr('stroke-opacity', bothOnline ? 0.3 : 0.1)
-            .attr('stroke-dasharray', bothOnline ? 'none' : '6,4')
+          if (isPartitioned) {
+            svg.select(`.edge-${edgeId}`)
+              .transition().duration(600)
+              .attr('stroke', '#ef4444')
+              .attr('stroke-opacity', 0.6)
+              .attr('stroke-dasharray', '8,4')
+              .attr('stroke-width', 2.5)
+
+            svg.select(`.edge-icon-${edgeId}`)
+              .transition().duration(400)
+              .attr('opacity', 1)
+          } else {
+            svg.select(`.edge-${edgeId}`)
+              .transition().duration(600)
+              .attr('stroke', bothOnline ? '#22c55e' : 'currentColor')
+              .attr('stroke-opacity', bothOnline ? 0.3 : 0.1)
+              .attr('stroke-dasharray', bothOnline ? 'none' : '6,4')
+              .attr('stroke-width', 2)
+
+            svg.select(`.edge-icon-${edgeId}`)
+              .transition().duration(400)
+              .attr('opacity', 0)
+          }
         }
       }
     }
-  }, [states, nodes, currentTopo])
+  }, [states, nodes, partitions, currentTopo])
 
   // 3) Event-driven effects
   useEffect(() => {

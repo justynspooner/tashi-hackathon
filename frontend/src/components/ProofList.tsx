@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useRef, useEffect } from 'react'
 import {
   Table,
   TableBody,
@@ -10,7 +10,6 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Shield, ShieldCheck, ShieldX, ChevronDown, ChevronRight } from 'lucide-react'
 import type { ProofOfCoordination, VerifyResult } from '@/types'
 import { verifyProof } from '@/hooks/useApi'
@@ -19,7 +18,11 @@ import { ProofDetail } from './ProofDetail'
 function formatTimestamp(ns: number): string {
   // consensus_at is in nanoseconds
   const ms = ns / 1_000_000
-  return new Date(ms).toLocaleTimeString()
+  const date = new Date(ms)
+  const now = new Date()
+  const isToday = date.toDateString() === now.toDateString()
+  if (isToday) return date.toLocaleTimeString()
+  return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 function truncateHash(hash: string): string {
@@ -27,10 +30,16 @@ function truncateHash(hash: string): string {
   return hash.slice(0, 8) + '...' + hash.slice(-8)
 }
 
-export function ProofList({ proofs }: { proofs: ProofOfCoordination[] }) {
+export function ProofList({ proofs: unsortedProofs }: { proofs: ProofOfCoordination[] }) {
+  const proofs = [...unsortedProofs].sort((a, b) => a.consensus_at > b.consensus_at ? -1 : a.consensus_at < b.consensus_at ? 1 : 0)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const [verifyResults, setVerifyResults] = useState<Record<string, VerifyResult>>({})
   const [verifying, setVerifying] = useState<Record<string, boolean>>({})
   const [expanded, setExpanded] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0
+  }, [proofs.length])
 
   async function handleVerify(proof: ProofOfCoordination) {
     const key = proof.file
@@ -76,7 +85,7 @@ export function ProofList({ proofs }: { proofs: ProofOfCoordination[] }) {
             No proofs generated yet. Run the agents with --proof-dir to generate proofs.
           </p>
         ) : (
-          <ScrollArea className="h-[500px]">
+          <div ref={scrollRef} className="h-[500px] overflow-y-auto">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -156,7 +165,7 @@ export function ProofList({ proofs }: { proofs: ProofOfCoordination[] }) {
                 })}
               </TableBody>
             </Table>
-          </ScrollArea>
+          </div>
         )}
       </CardContent>
     </Card>

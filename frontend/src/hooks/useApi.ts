@@ -143,10 +143,40 @@ export function useNodes() {
   return { nodes, startNode, stopNode, setRole, createSwarm, destroySwarm, refetch: fetchNodes }
 }
 
+export function usePartitions() {
+  const [partitions, setPartitions] = useState<[string, string][]>([])
+
+  const fetchPartitions = useCallback(async () => {
+    try {
+      const res = await fetch('/api/partitions')
+      const data = await res.json()
+      setPartitions(data.partitions ?? [])
+    } catch { /* server not ready */ }
+  }, [])
+
+  useEffect(() => { fetchPartitions() }, [fetchPartitions])
+
+  const togglePartition = useCallback(async (nodeA: string, nodeB: string) => {
+    const sorted = [nodeA, nodeB].sort()
+    const exists = partitions.some(p =>
+      [p[0], p[1]].sort().join() === sorted.join()
+    )
+    await fetch(exists ? '/api/partitions/heal' : '/api/partitions/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ node_a: sorted[0], node_b: sorted[1] }),
+    })
+    await fetchPartitions()
+  }, [partitions, fetchPartitions])
+
+  return { partitions, togglePartition, refetch: fetchPartitions }
+}
+
 export function useSSE(callbacks?: {
   onEventLog?: (entry: EventLogEntry) => void
   onUpdate?: () => void
   onNodeStatus?: () => void
+  onPartitionChanged?: () => void
 }) {
   const [connected, setConnected] = useState(false)
   const callbacksRef = useRef(callbacks)
@@ -165,6 +195,8 @@ export function useSSE(callbacks?: {
         callbacksRef.current.onUpdate()
       } else if ((data.type === 'node_status' || data.type === 'node_added' || data.type === 'swarm_created' || data.type === 'swarm_destroyed') && callbacksRef.current?.onNodeStatus) {
         callbacksRef.current.onNodeStatus()
+      } else if (data.type === 'partition_changed' && callbacksRef.current?.onPartitionChanged) {
+        callbacksRef.current.onPartitionChanged()
       }
     }
 

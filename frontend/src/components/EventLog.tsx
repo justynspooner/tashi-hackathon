@@ -1,14 +1,11 @@
 import { useEffect, useRef, useState, useMemo } from 'react'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Terminal, ArrowDown, ChevronsUpDown, Trash2, Download } from 'lucide-react'
+import { ArrowDown, Download, Trash2 } from 'lucide-react'
 import type { EventLogEntry } from '@/types'
 
 const ROW_HEIGHT = 22
-const COLLAPSED_ROWS = 5
-const EXPANDED_ROWS = 25
-const VISIBLE_BUFFER = 20 // extra rows above/below viewport
+const VISIBLE_BUFFER = 20
 
 const TAG_COLORS: Record<string, string> = {
   BOOT: 'bg-slate-500',
@@ -32,7 +29,6 @@ function labelColor(label: string): string {
   return 'text-muted-foreground'
 }
 
-// Pre-format timestamp to avoid Date allocations per render
 function formatTs(ts: number): string {
   const d = new Date(ts)
   const h = String(d.getHours()).padStart(2, '0')
@@ -46,17 +42,14 @@ export function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry
   const events = useMemo(() => rawEvents.filter(e => e.tag !== 'HEARTBEAT' && e.tag !== 'VERTEX_RX' && e.tag !== 'VERTEX_TX'), [rawEvents])
   const containerRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
-  const [expanded, setExpanded] = useState(true)
   const [scrollTop, setScrollTop] = useState(0)
-  const [containerHeight, setContainerHeight] = useState(COLLAPSED_ROWS * ROW_HEIGHT)
+  const [containerHeight, setContainerHeight] = useState(400)
 
-  // Auto-scroll on new events
   useEffect(() => {
     if (!autoScroll || !containerRef.current) return
     containerRef.current.scrollTop = containerRef.current.scrollHeight
   }, [events.length, autoScroll])
 
-  // Track container size
   useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -82,7 +75,17 @@ export function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry
     setAutoScroll(true)
   }
 
-  // Virtual window: only render visible rows + buffer
+  function handleDownload() {
+    const lines = events.map(e => `${new Date(e.ts).toISOString()}\t${e.tag}\t${e.label}\t${e.message}`)
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `vertex-events-${Date.now()}.log`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   const { startIdx, endIdx, totalHeight } = useMemo(() => {
     const total = events.length
     const totalH = total * ROW_HEIGHT
@@ -95,116 +98,80 @@ export function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry
   const visibleEvents = events.slice(startIdx, endIdx)
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="flex items-center gap-2">
-          <Terminal className="h-5 w-5" />
-          Live Event Log
-          <Badge variant="secondary">{events.length}</Badge>
-          <div className="ml-auto flex items-center gap-1">
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 px-2"
-              onClick={() => {
-                const lines = events.map(e => `${new Date(e.ts).toISOString()}\t${e.tag}\t${e.label}\t${e.message}`)
-                const blob = new Blob([lines.join('\n')], { type: 'text/plain' })
-                const url = URL.createObjectURL(blob)
-                const a = document.createElement('a')
-                a.href = url
-                a.download = `vertex-events-${Date.now()}.log`
-                a.click()
-                URL.revokeObjectURL(url)
-              }}
-            >
-              <Download className="h-3 w-3 mr-1" />
-              Download
+    <div className="flex flex-col h-full">
+      <div className="flex items-center gap-2 px-4 pt-4 pb-2">
+        <span className="text-sm font-medium">Live Event Log</span>
+        <Badge variant="secondary">{events.length}</Badge>
+        <div className="ml-auto flex items-center gap-1">
+          <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={handleDownload} title="Download">
+            <Download className="h-3.5 w-3.5" />
+          </Button>
+          {onClear && (
+            <Button size="sm" variant="ghost" className="h-6 w-6 p-0" onClick={onClear} title="Clear">
+              <Trash2 className="h-3.5 w-3.5" />
             </Button>
-            {onClear && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-6 px-2"
-                onClick={onClear}
+          )}
+        </div>
+      </div>
+      {events.length === 0 ? (
+        <p className="text-sm text-muted-foreground text-center py-8">
+          No events yet. Start the nodes to stream events here.
+        </p>
+      ) : (
+        <div className="relative flex-1 min-h-0">
+          <div
+            ref={containerRef}
+            onScroll={handleScroll}
+            className="overflow-y-auto h-full rounded-md border bg-muted/30 p-0"
+          >
+            <div style={{ height: totalHeight, position: 'relative' }}>
+              <div
+                className="font-mono text-xs"
+                style={{
+                  position: 'absolute',
+                  top: startIdx * ROW_HEIGHT,
+                  left: 0,
+                  right: 0,
+                }}
               >
-                <Trash2 className="h-3 w-3 mr-1" />
-                Clear
-              </Button>
-            )}
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 px-2"
-              onClick={() => setExpanded(e => !e)}
-            >
-              <ChevronsUpDown className="h-3 w-3 mr-1" />
-              {expanded ? 'Collapse' : 'Expand'}
-            </Button>
-          </div>
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        {events.length === 0 ? (
-          <p className="text-sm text-muted-foreground text-center py-8">
-            No events yet. Start the nodes to stream events here.
-          </p>
-        ) : (
-          <div className="relative">
-            <div
-              ref={containerRef}
-              onScroll={handleScroll}
-              className="overflow-y-auto rounded-md border bg-muted/30 p-0 transition-[height] duration-200"
-              style={{ height: (expanded ? EXPANDED_ROWS : COLLAPSED_ROWS) * ROW_HEIGHT }}
-            >
-              <div style={{ height: totalHeight, position: 'relative' }}>
-                <div
-                  className="font-mono text-xs"
-                  style={{
-                    position: 'absolute',
-                    top: startIdx * ROW_HEIGHT,
-                    left: 0,
-                    right: 0,
-                  }}
-                >
-                  {visibleEvents.map((event, i) => (
-                    <div
-                      key={startIdx + i}
-                      className="flex items-center gap-2 px-2 hover:bg-muted/50"
-                      style={{ height: ROW_HEIGHT }}
+                {visibleEvents.map((event, i) => (
+                  <div
+                    key={startIdx + i}
+                    className="flex items-center gap-2 px-2 hover:bg-muted/50"
+                    style={{ height: ROW_HEIGHT }}
+                  >
+                    <span className="text-muted-foreground shrink-0 w-[82px]">
+                      {formatTs(event.ts)}
+                    </span>
+                    <span
+                      className={`shrink-0 inline-flex items-center justify-center rounded px-1 text-[10px] font-bold text-white w-[72px] text-center ${TAG_COLORS[event.tag] ?? 'bg-gray-400'}`}
                     >
-                      <span className="text-muted-foreground shrink-0 w-[82px]">
-                        {formatTs(event.ts)}
-                      </span>
-                      <span
-                        className={`shrink-0 inline-flex items-center justify-center rounded px-1 text-[10px] font-bold text-white w-[72px] text-center ${TAG_COLORS[event.tag] ?? 'bg-gray-400'}`}
-                      >
-                        {event.tag}
-                      </span>
-                      <span className={`shrink-0 w-[60px] ${labelColor(event.label)}`}>
-                        {event.label}
-                      </span>
-                      <span className="text-foreground truncate">
-                        {event.message}
-                      </span>
-                    </div>
-                  ))}
-                </div>
+                      {event.tag}
+                    </span>
+                    <span className={`shrink-0 w-[60px] ${labelColor(event.label)}`}>
+                      {event.label}
+                    </span>
+                    <span className="text-foreground truncate">
+                      {event.message}
+                    </span>
+                  </div>
+                ))}
               </div>
             </div>
-            {!autoScroll && (
-              <Button
-                size="sm"
-                variant="secondary"
-                className="absolute bottom-4 right-4 shadow-md"
-                onClick={scrollToBottom}
-              >
-                <ArrowDown className="h-3 w-3 mr-1" />
-                Latest
-              </Button>
-            )}
           </div>
-        )}
-      </CardContent>
-    </Card>
+          {!autoScroll && (
+            <Button
+              size="sm"
+              variant="secondary"
+              className="absolute bottom-4 right-4 shadow-md"
+              onClick={scrollToBottom}
+            >
+              <ArrowDown className="h-3 w-3 mr-1" />
+              Latest
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
   )
 }

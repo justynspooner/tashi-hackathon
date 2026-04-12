@@ -1,6 +1,6 @@
+import { useRef, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Radio } from 'lucide-react'
 import { kindClass, kindIcon, roleColor } from '@/lib/utils'
 import type { ProofOfCoordination } from '@/types'
@@ -16,6 +16,7 @@ interface TimelineEvent {
 }
 
 export function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null)
   const events: TimelineEvent[] = proofs.flatMap(proof =>
     proof.transactions.map(tx => ({
       kind: tx.kind,
@@ -29,6 +30,10 @@ export function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
   )
 
   events.sort((a, b) => b.sent_at_ms - a.sent_at_ms)
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0
+  }, [events.length])
 
   return (
     <Card>
@@ -45,7 +50,7 @@ export function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
             No consensus events yet.
           </p>
         ) : (
-          <ScrollArea className="h-[400px]">
+          <div ref={scrollRef} className="h-[400px] overflow-y-auto">
             <div className="relative pl-6 space-y-0">
               <div className="absolute left-[11px] top-0 bottom-0 w-px bg-border" />
 
@@ -78,7 +83,7 @@ export function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
                 </div>
               ))}
             </div>
-          </ScrollArea>
+          </div>
         )}
       </CardContent>
     </Card>

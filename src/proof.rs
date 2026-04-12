@@ -23,6 +23,7 @@ pub struct ProofOfCoordination {
     pub consensus_at: u64,
     pub finality_ms: u64,
     pub event_hash: String,
+    pub whitened_signature: String,
     pub transactions: Vec<WireMessage>,
     pub content_hash: String,
 }
@@ -43,6 +44,9 @@ impl ProofOfCoordination {
         let created_at = event.created_at();
         let finality_ms = created_at.abs_diff(consensus_at) / 1_000_000;
         let event_hash = hex_encode(event.hash());
+        // whitened_signature() crashes via FFI abort — not safe to call.
+        // The field remains in the struct for future use if the SDK adds a safe accessor.
+        let whitened_signature = String::new();
 
         let transactions: Vec<WireMessage> = event
             .transactions()
@@ -54,6 +58,7 @@ impl ProofOfCoordination {
             created_at,
             consensus_at,
             &event_hash,
+            &whitened_signature,
             &transactions,
         );
 
@@ -63,6 +68,7 @@ impl ProofOfCoordination {
             consensus_at,
             finality_ms,
             event_hash,
+            whitened_signature,
             transactions,
             content_hash,
         })
@@ -79,6 +85,7 @@ impl ProofOfCoordination {
             self.created_at,
             self.consensus_at,
             &self.event_hash,
+            &self.whitened_signature,
             &self.transactions,
         );
         self.content_hash == expected
@@ -115,6 +122,7 @@ fn compute_content_hash(
     created_at: u64,
     consensus_at: u64,
     event_hash: &str,
+    whitened_signature: &str,
     transactions: &[WireMessage],
 ) -> String {
     let mut hasher = Sha256::new();
@@ -122,6 +130,7 @@ fn compute_content_hash(
     hasher.update(created_at.to_le_bytes());
     hasher.update(consensus_at.to_le_bytes());
     hasher.update(event_hash.as_bytes());
+    hasher.update(whitened_signature.as_bytes());
     let tx_json = serde_json::to_vec(transactions).unwrap_or_default();
     hasher.update(&tx_json);
     hex_encode(&hasher.finalize())

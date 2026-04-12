@@ -47,6 +47,16 @@ export function ProofDetail({
           <p className="font-mono text-xs break-all mt-1">{proof.event_hash}</p>
         </div>
         <div>
+          <span className="text-muted-foreground">Whitened Signature:</span>
+          {proof.whitened_signature ? (
+            <p className="font-mono text-xs break-all mt-1">{proof.whitened_signature}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground mt-1">
+              Unavailable — the Vertex SDK's whitened_signature() FFI call aborts for these events. Awaiting a safe accessor in a future SDK release.
+            </p>
+          )}
+        </div>
+        <div>
           <span className="text-muted-foreground">Content Hash:</span>
           <p className="font-mono text-xs break-all mt-1">{proof.content_hash}</p>
         </div>

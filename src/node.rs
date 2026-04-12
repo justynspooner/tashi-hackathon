@@ -97,7 +97,7 @@ pub async fn run(
     let mut options = Options::default();
     options.set_heartbeat_us(heartbeat_ms.saturating_mul(1_000));
     options.set_fallen_behind_kick_s(((stale_after_ms.max(1) + 999) / 1_000) as i64);
-    options.set_enable_state_sharing(true);
+    // options.set_enable_state_sharing(true);
     options.set_epoch_states_to_cache(10);
     let engine = Engine::start(&context, socket, options, &key, vertex_peers, joining)?;
     let local_public_key = key.public().to_string();
@@ -242,8 +242,34 @@ async fn engine_loop(
                             continue;
                         }
 
+                        // Log finality for consensus events that carry transactions
+                        if event.transaction_count() > 0 {
+                            let created = event.created_at();
+                            let consensus = event.consensus_at();
+                            let finality = created.abs_diff(consensus) / 1_000_000;
+                            let kinds: Vec<String> = event.transactions()
+                                .filter_map(|tx| serde_json::from_slice::<WireMessage>(tx).ok())
+                                .map(|w| w.kind.as_str().to_string())
+                                .collect();
+                            if !kinds.is_empty() {
+                                let kind_str = kinds.join(",");
+                                let state = runtime.lock().unwrap();
+                                log(
+                                    "FINALITY",
+                                    &state.label,
+                                    format!("{}ms kind={}", finality, kind_str),
+                                );
+                            }
+                        }
+
                         if let Some(ref dir) = proof_dir {
-                            if event.transaction_count() > 0 {
+                            // Only create proofs for events containing role changes (state_update)
+                            let has_state_update = event.transactions().any(|tx| {
+                                serde_json::from_slice::<WireMessage>(tx)
+                                    .map(|w| matches!(w.kind, MessageKind::StateUpdate))
+                                    .unwrap_or(false)
+                            });
+                            if has_state_update {
                                 if let Some(proof) = ProofOfCoordination::from_event(&event) {
                                     let proof_name = format!("proof-{proof_seq}.json");
                                     let path = dir.join(&proof_name);
@@ -294,16 +320,18 @@ async fn engine_loop(
 }
 
 fn process_tx_request(engine: &Engine, runtime: &SharedRuntime, req: TxRequest) {
+    let is_heartbeat = matches!(req.kind, MessageKind::Heartbeat);
     let action = req.note.clone().unwrap_or_else(|| req.kind.as_str().to_string());
-    {
+    if !is_heartbeat {
         let state = runtime.lock().unwrap();
         log("ACTION", &state.label, format!("sending {action} via Vertex..."));
     }
     match send_vertex_transaction(engine, runtime, req.kind, req.note) {
         Ok(msg) => {
             let state = runtime.lock().unwrap();
+            let tag = if is_heartbeat { "HEARTBEAT" } else { "ACTION" };
             log(
-                "ACTION",
+                tag,
                 &state.label,
                 format!("broadcast {action} as {}", msg.message_id),
             );
@@ -375,12 +403,20 @@ async fn control_loop(
     let started_at_ms = now_ms();
     let mut interval = time::interval(Duration::from_millis(200));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_heartbeat_ms = 0u64;
 
     loop {
         interval.tick().await;
         let now = now_ms();
         let mut should_send_state_update = false;
+        let mut should_send_heartbeat = false;
         let mut target_role = None;
+
+        // Application-level heartbeat every 2 seconds
+        if now.saturating_sub(last_heartbeat_ms) >= 2_000 {
+            should_send_heartbeat = true;
+            last_heartbeat_ms = now;
+        }
 
         {
             let mut state = runtime.lock().unwrap();
@@ -448,6 +484,11 @@ async fn control_loop(
             let _ = tx_sender.send(TxRequest {
                 kind: MessageKind::StateUpdate,
                 note: Some(format!("role -> {role}")),
+            });
+        } else if should_send_heartbeat {
+            let _ = tx_sender.send(TxRequest {
+                kind: MessageKind::Heartbeat,
+                note: None,
             });
         }
     }

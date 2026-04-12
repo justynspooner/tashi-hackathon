@@ -7,7 +7,7 @@ export function cn(...inputs: ClassValue[]) {
 
 export function timeSince(ms: number): string {
   const diff = Date.now() - ms
-  if (diff < 2000) return 'just now'
+  if (diff < 5000) return 'just now'
   if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`
   return `${Math.floor(diff / 60_000)}m ago`
 }

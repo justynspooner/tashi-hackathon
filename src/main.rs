@@ -1,4 +1,5 @@
 mod node;
+mod pf;
 mod proof;
 mod protocol;
 mod state;
@@ -46,7 +47,7 @@ enum Command {
         role: String,
         #[arg(long, default_value = "ready")]
         status: String,
-        #[arg(long, default_value_t = 1_000)]
+        #[arg(long, default_value_t = 50)]
         heartbeat_ms: u64,
         #[arg(long, default_value_t = 10_000)]
         stale_after_ms: u64,

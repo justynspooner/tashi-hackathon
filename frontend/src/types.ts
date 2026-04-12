@@ -30,6 +30,7 @@ export interface ProofOfCoordination {
   consensus_at: number
   finality_ms: number
   event_hash: string
+  whitened_signature: string
   transactions: WireMessage[]
   content_hash: string
 }

@@ -8,7 +8,9 @@ import {
   type ChartConfig,
 } from '@/components/ui/chart'
 import { Timer } from 'lucide-react'
-import type { ProofOfCoordination } from '@/types'
+import type { EventLogEntry } from '@/types'
+
+const MAX_POINTS = 200
 
 const chartConfig = {
   finality: {
@@ -24,21 +26,26 @@ interface DataPoint {
   agent: string
 }
 
-export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
+export function FinalityChart({ events }: { events: EventLogEntry[] }) {
   const data = useMemo(() => {
     const points: DataPoint[] = []
-    const sorted = [...proofs].sort((a, b) => a.consensus_at - b.consensus_at)
-    for (const proof of sorted) {
-      const kind = proof.transactions[0]?.kind ?? 'unknown'
+    for (const ev of events) {
+      if (ev.tag !== 'FINALITY') continue
+      // Parse "123ms kind=heartbeat" or "45ms kind=state_update"
+      const match = ev.message.match(/^(\d+)ms kind=(.+)$/)
+      if (!match) continue
+      const finality = parseInt(match[1])
+      const kind = match[2]
+      const isHeartbeat = kind === 'heartbeat'
       points.push({
-        label: `${proof.agent.replace('agent-', '')}:${kind.replace('state_', '')}`,
-        finality: proof.finality_ms,
+        label: isHeartbeat ? '' : `${ev.label.replace('agent-', '')}:${kind.replace('state_', '')}`,
+        finality,
         kind,
-        agent: proof.agent,
+        agent: ev.label,
       })
     }
-    return points
-  }, [proofs])
+    return points.slice(-MAX_POINTS)
+  }, [events])
 
   if (data.length === 0) return null
 
@@ -53,7 +60,7 @@ export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
           <Timer className="h-4 w-4" />
           Consensus Finality
           <span className="text-xs font-normal text-muted-foreground ml-auto">
-            avg {avg}ms &middot; min {min}ms &middot; max {max}ms
+            avg {avg}ms &middot; min {min}ms &middot; max {max}ms &middot; last {data.length}
           </span>
         </CardTitle>
       </CardHeader>
@@ -65,7 +72,11 @@ export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
               dataKey="label"
               tickLine={false}
               axisLine={false}
-              tick={{ fontSize: 10 }}
+              tick={{ fontSize: 9 }}
+              angle={-90}
+              textAnchor="end"
+              height={50}
+              interval={0}
             />
             <YAxis
               tickLine={false}
@@ -102,6 +113,7 @@ export function FinalityChart({ proofs }: { proofs: ProofOfCoordination[] }) {
               fill="url(#fillFinality)"
               fillOpacity={0.4}
               stroke="var(--color-finality)"
+              isAnimationActive={false}
             />
           </AreaChart>
         </ChartContainer>

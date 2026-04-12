@@ -1,6 +1,6 @@
 # Tashi Vertex Explorer
 
-A live coordination explorer built on the [Tashi Vertex](https://github.com/tashigit/tashi-vertex-rs) BFT consensus engine. Nodes perform a signed handshake, exchange heartbeats, replicate state, detect staleness, recover automatically, and produce cryptographic proofs of coordination — all visible in real time through a browser-based dashboard.
+A live coordination explorer built on the [Tashi Vertex](https://github.com/tashigit/tashi-vertex-rs) BFT consensus engine. Nodes perform signed handshakes, exchange heartbeats, replicate state, detect staleness, recover automatically, and produce cryptographic proofs of coordination — all visible in real time through a browser dashboard.
 
 ## Prerequisites
 
@@ -80,10 +80,32 @@ cargo run -- verify --proof-file artifacts/proofs/agent-a/proof-0.json
 ## Dashboard features
 
 - **Network Topology** — D3 visualization with animated pulses for heartbeats, state changes, and acknowledgements
-- **Node Control** — start/stop nodes, change roles via dropdown (carrier, scout, observer, relay)
+- **Node Control** — start/stop nodes, change roles (carrier, scout, observer, relay), create/destroy swarms
 - **Live Event Log** — virtualized scrolling log filtered by event type, driven by SSE
 - **Proofs of Coordination** — expandable table with one-click verification
+- **Finality Chart** — real-time area chart tracking consensus finality over time
 - **Event Timeline** — chronological view of consensus transactions extracted from proofs
+- **Partition Simulation** — create and heal network partitions between nodes to test fault tolerance (macOS only, uses `pfctl`)
+
+## API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/events` | SSE stream of real-time events |
+| GET | `/api/state` | Current agent states (local + peers) |
+| GET | `/api/proofs` | List all proofs |
+| GET | `/api/event-log` | Tail event log (optional `?limit=`) |
+| GET | `/api/proofs/:agent/:file/verify` | Verify a specific proof |
+| GET | `/api/nodes` | List configured nodes and status |
+| POST | `/api/nodes/:label/start` | Start a node |
+| POST | `/api/nodes/:label/stop` | Stop a node |
+| POST | `/api/nodes/:label/role` | Change a node's role |
+| POST | `/api/swarm` | Create multiple nodes at once |
+| DELETE | `/api/swarm` | Destroy all swarm nodes |
+| GET | `/api/partitions` | List active network partitions |
+| POST | `/api/partitions/create` | Create a partition between nodes |
+| POST | `/api/partitions/heal` | Heal a partition |
+| POST | `/api/clear-artifacts` | Reset all artifacts |
 
 ## Event tags
 
@@ -120,18 +142,21 @@ src/
   protocol.rs   — Wire format types (MessageKind, WireMessage, SharedState)
   state.rs      — Runtime state, persistence, cross-thread channel types
   proof.rs      — ProofOfCoordination generation and verification
+  pf.rs         — Network partition simulation via macOS pfctl
 
 frontend/
   src/
     App.tsx              — Main layout, SSE wiring
     hooks/useApi.ts      — Data hooks (SSE-driven, no polling)
     lib/utils.ts         — Shared helpers (role colors, formatting)
+    types.ts             — TypeScript interfaces
     components/
       NetworkGraph.tsx   — D3 network topology visualization
-      NodeControl.tsx    — Node start/stop/role management
+      NodeControl.tsx    — Node start/stop/role/swarm management
       EventLog.tsx       — Virtualized live event log
       ProofList.tsx      — Proof table with verification
       ProofDetail.tsx    — Expandable proof details
+      FinalityChart.tsx  — Consensus finality metrics chart
       EventTimeline.tsx  — Chronological consensus timeline
 ```
 
@@ -141,4 +166,5 @@ frontend/
 - Heartbeats, state updates, and ACKs flow over a direct UDP control channel (`bind_port + 1000`).
 - The Axum server communicates with node threads via `tokio::sync::mpsc` channels — no file-based IPC.
 - State changes are pushed to the frontend via SSE in real time.
-- Proof files are still written to disk under `artifacts/proofs/` for durability.
+- Proof files are written to disk under `artifacts/proofs/` for durability.
+- Network partitions are simulated using macOS packet filter rules (`pfctl`) to block UDP traffic between specific ports.

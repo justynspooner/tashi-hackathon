@@ -17,6 +17,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 
+use crate::pf::PfPartitionManager;
 use crate::proof::ProofOfCoordination;
 use crate::protocol::SharedState;
 use crate::state::now_ms;
@@ -94,6 +95,8 @@ struct AppState {
     log_offsets: Mutex<HashMap<String, u64>>,
     /// Per-node proof count for detecting new proofs.
     proof_counts: Mutex<HashMap<String, usize>>,
+    /// Packet filter manager for network partition simulation.
+    pf: PfPartitionManager,
 }
 
 // --- Server entry point ---
@@ -118,6 +121,7 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         project_root,
         log_offsets: Mutex::new(HashMap::new()),
         proof_counts: Mutex::new(HashMap::new()),
+        pf: PfPartitionManager::new(),
     });
 
     load_existing_artifacts(&state, &artifacts_dir);
@@ -139,6 +143,9 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         .route("/api/nodes/{label}/stop", post(stop_node))
         .route("/api/nodes/{label}/role", post(set_role))
         .route("/api/swarm", post(create_swarm).delete(destroy_swarm))
+        .route("/api/partitions", get(get_partitions))
+        .route("/api/partitions/create", post(create_partition))
+        .route("/api/partitions/heal", post(heal_partition))
         .route("/api/clear-artifacts", post(clear_artifacts))
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
@@ -158,7 +165,8 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Cleanup: kill all child processes
+    // Cleanup: restore pf rules, then kill all child processes
+    state.pf.restore().await;
     {
         let mut nodes = state.nodes.lock().unwrap();
         for (_, mut handle) in nodes.drain() {
@@ -295,9 +303,16 @@ async fn file_watcher(state: Arc<AppState>) {
                         .collect();
                     let prev_count = state.proof_counts.lock().unwrap().get(label).copied().unwrap_or(0);
                     if files.len() > prev_count {
-                        // Load new proofs
+                        // Load new proofs — sort numerically by proof index
                         let mut all_files: Vec<_> = files.iter().map(|f| f.path()).collect();
-                        all_files.sort();
+                        all_files.sort_by(|a, b| {
+                            let num = |p: &std::path::PathBuf| -> usize {
+                                p.file_stem()
+                                    .and_then(|s| s.to_string_lossy().strip_prefix("proof-").map(|n| n.parse().unwrap_or(0)))
+                                    .unwrap_or(0)
+                            };
+                            num(a).cmp(&num(b))
+                        });
                         for path in &all_files[prev_count..] {
                             if let Ok(data) = std::fs::read_to_string(path) {
                                 if let Ok(proof) = serde_json::from_str::<ProofOfCoordination>(&data) {
@@ -385,9 +400,11 @@ fn load_existing_artifacts(state: &AppState, artifacts_dir: &Path) {
             if !agent_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) { continue; }
             let agent = agent_entry.file_name().to_string_lossy().to_string();
             if let Ok(files) = std::fs::read_dir(agent_entry.path()) {
+                let mut count = 0usize;
                 for file_entry in files.flatten() {
                     let fname = file_entry.file_name().to_string_lossy().to_string();
                     if !fname.ends_with(".json") { continue; }
+                    count += 1;
                     if let Ok(data) = std::fs::read_to_string(file_entry.path()) {
                         if let Ok(proof) = serde_json::from_str::<ProofOfCoordination>(&data) {
                             state.proofs.lock().unwrap().push(ProofResponse {
@@ -398,6 +415,7 @@ fn load_existing_artifacts(state: &AppState, artifacts_dir: &Path) {
                         }
                     }
                 }
+                state.proof_counts.lock().unwrap().insert(agent.clone(), count);
             }
         }
     }
@@ -674,6 +692,9 @@ async fn create_swarm(
 async fn destroy_swarm(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    // Restore pf rules
+    state.pf.restore().await;
+
     // Kill all running child processes
     {
         let mut nodes = state.nodes.lock().unwrap();
@@ -704,6 +725,87 @@ async fn destroy_swarm(
     );
 
     Json(serde_json::json!({"status": "ok"}))
+}
+
+// --- Network partition simulation ---
+
+#[derive(Deserialize)]
+struct PartitionRequest {
+    node_a: String,
+    node_b: String,
+}
+
+fn label_to_port(config: &NodesConfig, label: &str) -> Option<u16> {
+    config.nodes.iter()
+        .find(|n| n.label == label)
+        .and_then(|n| n.bind.rsplit(':').next()?.parse().ok())
+}
+
+fn partition_list(state: &AppState) -> Vec<[String; 2]> {
+    let config = state.config.lock().unwrap();
+    state.pf.blocked_pairs().iter().filter_map(|(pa, pb)| {
+        let la = config.nodes.iter().find(|n| {
+            n.bind.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) == Some(*pa)
+        })?.label.clone();
+        let lb = config.nodes.iter().find(|n| {
+            n.bind.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) == Some(*pb)
+        })?.label.clone();
+        Some([la, lb])
+    }).collect()
+}
+
+async fn get_partitions(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "partitions": partition_list(&state) }))
+}
+
+async fn create_partition(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PartitionRequest>,
+) -> Json<serde_json::Value> {
+    let (port_a, port_b) = {
+        let config = state.config.lock().unwrap();
+        match (label_to_port(&config, &body.node_a), label_to_port(&config, &body.node_b)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Json(serde_json::json!({"error": "unknown node label"})),
+        }
+    };
+
+    if let Err(e) = state.pf.partition(port_a, port_b).await {
+        return Json(serde_json::json!({"error": e.to_string()}));
+    }
+
+    let partitions = partition_list(&state);
+    let _ = state.sse_tx.send(
+        serde_json::json!({"type": "partition_changed", "partitions": partitions}).to_string(),
+    );
+
+    Json(serde_json::json!({"status": "ok", "partitioned": true}))
+}
+
+async fn heal_partition(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PartitionRequest>,
+) -> Json<serde_json::Value> {
+    let (port_a, port_b) = {
+        let config = state.config.lock().unwrap();
+        match (label_to_port(&config, &body.node_a), label_to_port(&config, &body.node_b)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Json(serde_json::json!({"error": "unknown node label"})),
+        }
+    };
+
+    if let Err(e) = state.pf.heal(port_a, port_b).await {
+        return Json(serde_json::json!({"error": e.to_string()}));
+    }
+
+    let partitions = partition_list(&state);
+    let _ = state.sse_tx.send(
+        serde_json::json!({"type": "partition_changed", "partitions": partitions}).to_string(),
+    );
+
+    Json(serde_json::json!({"status": "ok", "partitioned": false}))
 }
 
 async fn clear_artifacts(

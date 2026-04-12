@@ -1,4 +1,4 @@
-import { useCallback } from 'react'
+import { useCallback, useState } from 'react'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
 import { ProofList } from '@/components/ProofList'
@@ -8,14 +8,16 @@ import { NetworkGraph } from '@/components/NetworkGraph'
 import { NodeControl } from '@/components/NodeControl'
 import { FinalityChart } from '@/components/FinalityChart'
 import { Button } from '@/components/ui/button'
-import { useAgentStates, useProofs, useEventLog, useNodes, useSSE } from '@/hooks/useApi'
-import { Wifi, WifiOff, Trash2 } from 'lucide-react'
+import { useAgentStates, useProofs, useEventLog, useNodes, usePartitions, useSSE } from '@/hooks/useApi'
+import { Wifi, WifiOff, Trash2, Terminal } from 'lucide-react'
 
 export default function App() {
   const { states, refetch: refetchStates } = useAgentStates()
   const { proofs, refetch: refetchProofs } = useProofs()
   const { events, appendEvent, clearEvents } = useEventLog()
   const { nodes, startNode, stopNode, setRole, createSwarm, destroySwarm, refetch: refetchNodes } = useNodes()
+  const { partitions, togglePartition, refetch: refetchPartitions } = usePartitions()
+  const [eventLogOpen, setEventLogOpen] = useState(false)
 
   const handleUpdate = useCallback(() => {
     refetchStates()
@@ -35,11 +37,12 @@ export default function App() {
     onEventLog: appendEvent,
     onUpdate: handleUpdate,
     onNodeStatus: refetchNodes,
+    onPartitionChanged: refetchPartitions,
   })
 
   return (
-    <div className="min-h-screen bg-background">
-      <header className="border-b px-6 py-4">
+    <div className="h-screen bg-background flex flex-col overflow-hidden">
+      <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 px-6 py-3">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-xl font-semibold tracking-tight">
@@ -58,6 +61,17 @@ export default function App() {
               <Trash2 className="h-3 w-3 mr-1" />
               Clear Artifacts
             </Button>
+            <Button
+              size="sm"
+              variant={eventLogOpen ? 'default' : 'outline'}
+              onClick={() => setEventLogOpen(o => !o)}
+            >
+              <Terminal className="h-3 w-3 mr-1" />
+              Event Log
+              {events.length > 0 && (
+                <Badge variant="secondary" className="ml-1.5 text-xs">{events.length}</Badge>
+              )}
+            </Button>
             {connected ? (
               <Badge variant="outline" className="gap-1">
                 <Wifi className="h-3 w-3 text-green-500" />
@@ -73,36 +87,31 @@ export default function App() {
         </div>
       </header>
 
-      <main className="w-full p-6">
-        {/* Three-column layout: Node Control | Network + Finality | Event Log */}
-        <div className="flex gap-6 items-start">
-          {/* Left: Node Control stacked vertically */}
-          <div className="w-80 shrink-0">
-            <NodeControl
-              nodes={nodes}
-              states={states}
-              onStart={startNode}
-              onStop={stopNode}
-              onSetRole={setRole}
-              onCreateSwarm={createSwarm}
-              onDestroySwarm={destroySwarm}
-            />
+      <div className="flex flex-1 min-h-0">
+        <main className="flex-1 min-w-0 p-6 overflow-y-auto space-y-6">
+          {/* Node control (2/3) + Network topology (1/3) */}
+          <div className="flex gap-6 items-start">
+            <div className="w-2/3 min-w-0">
+              <NodeControl
+                nodes={nodes}
+                states={states}
+                events={events}
+                onStart={startNode}
+                onStop={stopNode}
+                onSetRole={setRole}
+                onCreateSwarm={createSwarm}
+                onDestroySwarm={destroySwarm}
+              />
+            </div>
+            <div className="w-1/3 shrink-0">
+              <NetworkGraph states={states} events={events} nodes={nodes} partitions={partitions} onTogglePartition={togglePartition} />
+            </div>
           </div>
 
-          {/* Center: Network Topology + Consensus Finality stacked */}
-          <div className="flex-1 min-w-0 space-y-6">
-            <NetworkGraph states={states} events={events} nodes={nodes} />
-            <FinalityChart proofs={proofs} />
-          </div>
+          {/* Consensus finality — full width */}
+          <FinalityChart events={events} />
 
-          {/* Right: Event Log */}
-          <div className="w-96 shrink-0">
-            <EventLog events={events} onClear={clearEvents} />
-          </div>
-        </div>
-
-        {/* Proofs / Timeline below */}
-        <div className="mt-6">
+          {/* Proofs / Timeline */}
           <Tabs defaultValue="proofs">
             <TabsList>
               <TabsTrigger value="proofs">
@@ -124,8 +133,14 @@ export default function App() {
               <EventTimeline proofs={proofs} />
             </TabsContent>
           </Tabs>
-        </div>
-      </main>
+        </main>
+
+        {eventLogOpen && (
+          <aside className="w-96 shrink-0 border-l bg-background flex flex-col">
+            <EventLog events={events} onClear={clearEvents} />
+          </aside>
+        )}
+      </div>
     </div>
   )
 }
