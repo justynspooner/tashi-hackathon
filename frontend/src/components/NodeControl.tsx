@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { memo, useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -114,7 +114,7 @@ function NodeEventLog({ events }: { events: EventLogEntry[] }) {
 
 // --- Single node card ---
 
-function NodeCard({
+const NodeCard = memo(function NodeCard({
   node,
   agentState,
   events,
@@ -129,9 +129,9 @@ function NodeCard({
   events: EventLogEntry[]
   loading: boolean
   peerIdToLabel: Record<string, string>
-  onStart: () => void
-  onStop: () => void
-  onSetRole: (role: string) => void
+  onStart: (label: string) => void
+  onStop: (label: string) => void
+  onSetRole: (label: string, role: string) => void
 }) {
   return (
     <Card className="w-56 shrink-0 flex flex-col">
@@ -142,11 +142,11 @@ function NodeCard({
           <span className="text-[10px] text-muted-foreground">{node.bind}</span>
           <div className="ml-auto flex items-center gap-1">
             {node.status === 'running' ? (
-              <Button size="sm" variant="destructive" className="h-5 w-5 p-0" disabled={loading} onClick={onStop}>
+              <Button size="sm" variant="destructive" className="h-5 w-5 p-0" disabled={loading} onClick={() => onStop(node.label)}>
                 <PowerOff className="h-3 w-3" />
               </Button>
             ) : (
-              <Button size="sm" className="h-5 w-5 p-0" disabled={loading} onClick={onStart}>
+              <Button size="sm" className="h-5 w-5 p-0" disabled={loading} onClick={() => onStart(node.label)}>
                 <Power className="h-3 w-3" />
               </Button>
             )}
@@ -157,7 +157,7 @@ function NodeCard({
         <div className="flex items-center gap-1.5">
           <Select
             value={node.role ?? ''}
-            onValueChange={(value) => value && onSetRole(value)}
+            onValueChange={(value) => value && onSetRole(node.label, value)}
           >
             <SelectTrigger className={`h-5 text-[10px] flex-1 px-1.5 ${node.role ? roleColor(node.role) : ''}`}>
               <SelectValue placeholder="role" />
@@ -199,7 +199,7 @@ function NodeCard({
       </CardContent>
     </Card>
   )
-}
+})
 
 // --- Main export ---
 
@@ -214,7 +214,7 @@ interface Props {
   onDestroySwarm: () => Promise<void>
 }
 
-export function NodeControl({ nodes, states, events, onStart, onStop, onSetRole, onCreateSwarm, onDestroySwarm }: Props) {
+export const NodeControl = memo(function NodeControl({ nodes, states, events, onStart, onStop, onSetRole, onCreateSwarm, onDestroySwarm }: Props) {
   const [loading, setLoading] = useState<Record<string, boolean>>({})
   const [swarmSizeInput, setSwarmSizeInput] = useState('7')
   const [swarmDialogOpen, setSwarmDialogOpen] = useState(false)
@@ -244,6 +244,8 @@ export function NodeControl({ nodes, states, events, onStart, onStop, onSetRole,
     return map
   }, [states])
 
+  const allRunning = nodes.length > 0 && nodes.every(n => n.status === 'running')
+
   async function handleStartAll() {
     setLoading(prev => ({ ...prev, '__start_all__': true }))
     try {
@@ -254,17 +256,27 @@ export function NodeControl({ nodes, states, events, onStart, onStop, onSetRole,
     } finally { setLoading(prev => ({ ...prev, '__start_all__': false })) }
   }
 
-  async function handleStart(label: string) {
+  async function handleStopAll() {
+    setLoading(prev => ({ ...prev, '__stop_all__': true }))
+    try {
+      const running = nodes.filter(n => n.status === 'running')
+      for (const node of running) {
+        await onStop(node.label)
+      }
+    } finally { setLoading(prev => ({ ...prev, '__stop_all__': false })) }
+  }
+
+  const handleStart = useCallback(async (label: string) => {
     setLoading(prev => ({ ...prev, [label]: true }))
     try { await onStart(label) }
     finally { setTimeout(() => setLoading(prev => ({ ...prev, [label]: false })), 1000) }
-  }
+  }, [onStart])
 
-  async function handleStop(label: string) {
+  const handleStop = useCallback(async (label: string) => {
     setLoading(prev => ({ ...prev, [label]: true }))
     try { await onStop(label) }
     finally { setTimeout(() => setLoading(prev => ({ ...prev, [label]: false })), 1000) }
-  }
+  }, [onStop])
 
   async function handleCreateSwarm() {
     setLoading(prev => ({ ...prev, '__swarm__': true }))
@@ -303,15 +315,28 @@ export function NodeControl({ nodes, states, events, onStart, onStop, onSetRole,
             </Button>
           ) : (
             <>
-              <Button
-                size="sm"
-                className="h-6 px-2 text-xs gap-1"
-                disabled={loading['__start_all__']}
-                onClick={handleStartAll}
-              >
-                <Power className="h-3 w-3" />
-                {loading['__start_all__'] ? 'Starting...' : 'Start All'}
-              </Button>
+              {allRunning ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 px-2 text-xs gap-1"
+                  disabled={loading['__stop_all__']}
+                  onClick={handleStopAll}
+                >
+                  <PowerOff className="h-3 w-3" />
+                  {loading['__stop_all__'] ? 'Stopping...' : 'Stop All'}
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  className="h-6 px-2 text-xs gap-1"
+                  disabled={loading['__start_all__']}
+                  onClick={handleStartAll}
+                >
+                  <Power className="h-3 w-3" />
+                  {loading['__start_all__'] ? 'Starting...' : 'Start All'}
+                </Button>
+              )}
               <Button
                 size="sm"
                 variant="destructive"
@@ -342,9 +367,9 @@ export function NodeControl({ nodes, states, events, onStart, onStop, onSetRole,
               events={eventsByNode[node.label] ?? []}
               loading={!!loading[node.label]}
               peerIdToLabel={peerIdToLabel}
-              onStart={() => handleStart(node.label)}
-              onStop={() => handleStop(node.label)}
-              onSetRole={(role) => onSetRole(node.label, role)}
+              onStart={handleStart}
+              onStop={handleStop}
+              onSetRole={onSetRole}
             />
           ))}
         </div>
@@ -400,4 +425,4 @@ export function NodeControl({ nodes, states, events, onStart, onStop, onSetRole,
       </AlertDialog>
     </div>
   )
-}
+})

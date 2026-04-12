@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react'
+import { memo, useRef, useEffect, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Radio } from 'lucide-react'
@@ -15,21 +15,23 @@ interface TimelineEvent {
   note?: string
 }
 
-export function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
+export const EventTimeline = memo(function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
   const scrollRef = useRef<HTMLDivElement>(null)
-  const events: TimelineEvent[] = proofs.flatMap(proof =>
-    proof.transactions.map(tx => ({
-      kind: tx.kind,
-      message_id: tx.message_id,
-      sent_at_ms: tx.sent_at_ms,
-      agent: proof.agent,
-      role: tx.state.role,
-      status: tx.state.status,
-      note: tx.note ?? undefined,
-    }))
-  )
-
-  events.sort((a, b) => b.sent_at_ms - a.sent_at_ms)
+  const events = useMemo(() => {
+    const result: TimelineEvent[] = proofs.flatMap(proof =>
+      proof.transactions.map(tx => ({
+        kind: tx.kind,
+        message_id: tx.message_id,
+        sent_at_ms: tx.sent_at_ms,
+        agent: proof.agent,
+        role: tx.state.role,
+        status: tx.state.status,
+        note: tx.note ?? undefined,
+      }))
+    )
+    result.sort((a, b) => b.sent_at_ms - a.sent_at_ms)
+    return result
+  }, [proofs])
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0
@@ -88,4 +90,4 @@ export function EventTimeline({ proofs }: { proofs: ProofOfCoordination[] }) {
       </CardContent>
     </Card>
   )
-}
+})

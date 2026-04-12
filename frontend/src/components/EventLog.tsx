@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from 'react'
+import { memo, useEffect, useRef, useState, useMemo } from 'react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ArrowDown, Download, Trash2 } from 'lucide-react'
@@ -38,7 +38,7 @@ function formatTs(ts: number): string {
   return `${h}:${m}:${s}.${ms}`
 }
 
-export function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry[], onClear?: () => void }) {
+export const EventLog = memo(function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry[], onClear?: () => void }) {
   const events = useMemo(() => rawEvents.filter(e => e.tag !== 'HEARTBEAT' && e.tag !== 'VERTEX_RX' && e.tag !== 'VERTEX_TX'), [rawEvents])
   const containerRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
@@ -174,4 +174,4 @@ export function EventLog({ events: rawEvents, onClear }: { events: EventLogEntry
       )}
     </div>
   )
-}
+})

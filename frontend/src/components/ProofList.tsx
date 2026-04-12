@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react'
+import React, { memo, useState, useRef, useEffect, useMemo } from 'react'
 import {
   Table,
   TableBody,
@@ -30,8 +30,11 @@ function truncateHash(hash: string): string {
   return hash.slice(0, 8) + '...' + hash.slice(-8)
 }
 
-export function ProofList({ proofs: unsortedProofs }: { proofs: ProofOfCoordination[] }) {
-  const proofs = [...unsortedProofs].sort((a, b) => a.consensus_at > b.consensus_at ? -1 : a.consensus_at < b.consensus_at ? 1 : 0)
+export const ProofList = memo(function ProofList({ proofs: unsortedProofs }: { proofs: ProofOfCoordination[] }) {
+  const proofs = useMemo(() =>
+    [...unsortedProofs].sort((a, b) => a.consensus_at > b.consensus_at ? -1 : a.consensus_at < b.consensus_at ? 1 : 0),
+    [unsortedProofs]
+  )
   const scrollRef = useRef<HTMLDivElement>(null)
   const [verifyResults, setVerifyResults] = useState<Record<string, VerifyResult>>({})
   const [verifying, setVerifying] = useState<Record<string, boolean>>({})
@@ -170,4 +173,4 @@ export function ProofList({ proofs: unsortedProofs }: { proofs: ProofOfCoordinat
       </CardContent>
     </Card>
   )
-}
+})

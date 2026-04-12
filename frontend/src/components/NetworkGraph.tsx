@@ -1,4 +1,4 @@
-import { useEffect, useRef, useMemo } from 'react'
+import { memo, useEffect, useRef, useMemo } from 'react'
 import * as d3 from 'd3'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Network } from 'lucide-react'
@@ -47,7 +47,7 @@ function topoKey(nodes: NodeInfo[], states: AgentState[]): string {
   return labels.sort().join(',') || ''
 }
 
-export function NetworkGraph({ states, events, nodes, partitions = [], onTogglePartition }: Props) {
+export const NetworkGraph = memo(function NetworkGraph({ states, events, nodes, partitions = [], onTogglePartition }: Props) {
   const svgRef = useRef<SVGSVGElement>(null)
   const lastEventCount = useRef(0)
   const layoutRef = useRef<Map<string, { x: number; y: number }>>(new Map())
@@ -136,6 +136,7 @@ export function NetworkGraph({ states, events, nodes, partitions = [], onToggleP
         .attr('stroke-width', 14)
         .attr('cursor', 'pointer')
         .on('click', () => {
+          console.log('[NetworkGraph] edge clicked', labelA, labelB, 'handler=', !!onToggleRef.current)
           onToggleRef.current?.(labelA, labelB)
         })
     }
@@ -422,4 +423,4 @@ export function NetworkGraph({ states, events, nodes, partitions = [], onToggleP
       </CardContent>
     </Card>
   )
-}
+})

@@ -3,6 +3,7 @@ import type { AgentState, EventLogEntry, NodeInfo, ProofOfCoordination } from '.
 
 const MAX_LOG_ENTRIES = 5000
 const EVENT_LOG_STORAGE_KEY = 'vertex-event-log'
+const STORAGE_FLUSH_MS = 2000
 
 function loadCachedEvents(): EventLogEntry[] {
   try {
@@ -12,10 +13,35 @@ function loadCachedEvents(): EventLogEntry[] {
   return []
 }
 
+let storageFlushTimer: ReturnType<typeof setTimeout> | null = null
+let pendingEvents: EventLogEntry[] | null = null
+
 function saveCachedEvents(events: EventLogEntry[]) {
-  try {
-    sessionStorage.setItem(EVENT_LOG_STORAGE_KEY, JSON.stringify(events))
-  } catch { /* storage full — silently drop */ }
+  pendingEvents = events
+  if (storageFlushTimer) return
+  storageFlushTimer = setTimeout(() => {
+    storageFlushTimer = null
+    if (pendingEvents) {
+      try {
+        sessionStorage.setItem(EVENT_LOG_STORAGE_KEY, JSON.stringify(pendingEvents))
+      } catch { /* storage full — silently drop */ }
+      pendingEvents = null
+    }
+  }, STORAGE_FLUSH_MS)
+}
+
+function useThrottledCallback<T extends (...args: unknown[]) => void>(fn: T, delayMs: number): T {
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const fnRef = useRef(fn)
+  fnRef.current = fn
+
+  const throttled = useCallback((...args: unknown[]) => {
+    if (timerRef.current) return
+    fnRef.current(...args)
+    timerRef.current = setTimeout(() => { timerRef.current = null }, delayMs)
+  }, [delayMs]) as T
+
+  return throttled
 }
 
 export function useAgentStates() {
@@ -50,8 +76,12 @@ export function useProofs() {
   return { proofs, refetch: fetchProofs }
 }
 
+const EVENT_BATCH_MS = 100
+
 export function useEventLog() {
   const [events, setEvents] = useState<EventLogEntry[]>(loadCachedEvents)
+  const pendingBatch = useRef<EventLogEntry[]>([])
+  const batchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Merge server tail with cached events on mount
   useEffect(() => {
@@ -60,7 +90,6 @@ export function useEventLog() {
         const res = await fetch('/api/event-log?tail=200')
         const serverEvents: EventLogEntry[] = await res.json()
         setEvents(prev => {
-          // Merge: use cached events as base, append any server events newer than our latest
           const lastTs = prev.length > 0 ? prev[prev.length - 1].ts : 0
           const newer = serverEvents.filter(e => e.ts > lastTs)
           const merged = [...prev, ...newer]
@@ -73,20 +102,37 @@ export function useEventLog() {
     fetchTail()
   }, [])
 
-  const appendEvent = useCallback((entry: EventLogEntry) => {
+  const flushBatch = useCallback(() => {
+    batchTimer.current = null
+    const batch = pendingBatch.current
+    if (batch.length === 0) return
+    pendingBatch.current = []
     setEvents(prev => {
-      const last = prev[prev.length - 1]
-      if (last && last.ts === entry.ts && last.label === entry.label && last.tag === entry.tag) {
-        return prev
+      let next = prev
+      for (const entry of batch) {
+        const last = next[next.length - 1]
+        if (last && last.ts === entry.ts && last.label === entry.label && last.tag === entry.tag) {
+          continue
+        }
+        next = next === prev ? [...prev, entry] : (next.push(entry), next)
       }
-      const next = [...prev, entry]
+      if (next === prev) return prev
       const trimmed = next.length > MAX_LOG_ENTRIES ? next.slice(-MAX_LOG_ENTRIES) : next
       saveCachedEvents(trimmed)
       return trimmed
     })
   }, [])
 
+  const appendEvent = useCallback((entry: EventLogEntry) => {
+    pendingBatch.current.push(entry)
+    if (!batchTimer.current) {
+      batchTimer.current = setTimeout(flushBatch, EVENT_BATCH_MS)
+    }
+  }, [flushBatch])
+
   const clearEvents = useCallback(() => {
+    pendingBatch.current = []
+    if (batchTimer.current) { clearTimeout(batchTimer.current); batchTimer.current = null }
     setEvents([])
     saveCachedEvents([])
   }, [])
@@ -161,11 +207,19 @@ export function usePartitions() {
     const exists = partitions.some(p =>
       [p[0], p[1]].sort().join() === sorted.join()
     )
-    await fetch(exists ? '/api/partitions/heal' : '/api/partitions/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ node_a: sorted[0], node_b: sorted[1] }),
-    })
+    const endpoint = exists ? '/api/partitions/heal' : '/api/partitions/create'
+    console.log('[partition] toggle', sorted, 'exists=', exists, 'endpoint=', endpoint)
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_a: sorted[0], node_b: sorted[1] }),
+      })
+      const data = await res.json()
+      console.log('[partition] response', res.status, data)
+    } catch (err) {
+      console.error('[partition] fetch error', err)
+    }
     await fetchPartitions()
   }, [partitions, fetchPartitions])
 
@@ -182,6 +236,17 @@ export function useSSE(callbacks?: {
   const callbacksRef = useRef(callbacks)
   callbacksRef.current = callbacks
 
+  // Throttle bulk-refetch callbacks so rapid SSE bursts don't cascade
+  const throttledUpdate = useThrottledCallback(() => {
+    callbacksRef.current?.onUpdate?.()
+  }, 500)
+  const throttledNodeStatus = useThrottledCallback(() => {
+    callbacksRef.current?.onNodeStatus?.()
+  }, 500)
+  const throttledPartition = useThrottledCallback(() => {
+    callbacksRef.current?.onPartitionChanged?.()
+  }, 500)
+
   useEffect(() => {
     const source = new EventSource('/api/events')
 
@@ -191,19 +256,19 @@ export function useSSE(callbacks?: {
         setConnected(true)
       } else if (data.type === 'event_log' && callbacksRef.current?.onEventLog) {
         callbacksRef.current.onEventLog(data.entry)
-      } else if (data.type === 'update' && callbacksRef.current?.onUpdate) {
-        callbacksRef.current.onUpdate()
-      } else if ((data.type === 'node_status' || data.type === 'node_added' || data.type === 'swarm_created' || data.type === 'swarm_destroyed') && callbacksRef.current?.onNodeStatus) {
-        callbacksRef.current.onNodeStatus()
-      } else if (data.type === 'partition_changed' && callbacksRef.current?.onPartitionChanged) {
-        callbacksRef.current.onPartitionChanged()
+      } else if (data.type === 'update') {
+        throttledUpdate()
+      } else if (data.type === 'node_status' || data.type === 'node_added' || data.type === 'swarm_created' || data.type === 'swarm_destroyed') {
+        throttledNodeStatus()
+      } else if (data.type === 'partition_changed') {
+        throttledPartition()
       }
     }
 
     source.onerror = () => setConnected(false)
 
     return () => source.close()
-  }, [])
+  }, [throttledUpdate, throttledNodeStatus, throttledPartition])
 
   return { connected }
 }

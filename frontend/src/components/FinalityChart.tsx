@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -26,7 +26,7 @@ interface DataPoint {
   agent: string
 }
 
-export function FinalityChart({ events }: { events: EventLogEntry[] }) {
+export const FinalityChart = memo(function FinalityChart({ events }: { events: EventLogEntry[] }) {
   const data = useMemo(() => {
     const points: DataPoint[] = []
     for (const ev of events) {
@@ -120,4 +120,4 @@ export function FinalityChart({ events }: { events: EventLogEntry[] }) {
       </CardContent>
     </Card>
   )
-}
+})
