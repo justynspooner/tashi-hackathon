@@ -53,4 +53,6 @@ export interface NodeInfo {
   bind: string
   role: string | null
   status: 'running' | 'stopped'
+  initial_x?: number | null
+  initial_y?: number | null
 }

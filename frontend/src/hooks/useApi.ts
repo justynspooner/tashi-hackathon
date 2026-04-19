@@ -254,11 +254,25 @@ export function usePartitions() {
   return { partitions, togglePartition, refetch: fetchPartitions }
 }
 
+export interface RuleViolatedEvent {
+  label: string
+  rule_id: string
+  reason: string
+}
+
+export interface PartitionAutoEvent {
+  partitions: [string, string][]
+  radius_m: number
+}
+
 export function useSSE(callbacks?: {
   onEventLog?: (entry: EventLogEntry) => void
   onUpdate?: () => void
   onNodeStatus?: () => void
   onPartitionChanged?: () => void
+  onPartitionAuto?: (event: PartitionAutoEvent) => void
+  onGameStateChanged?: (label: string, snapshot: unknown) => void
+  onRuleViolated?: (event: RuleViolatedEvent) => void
 }) {
   const [connected, setConnected] = useState(false)
   const callbacksRef = useRef(callbacks)
@@ -290,6 +304,19 @@ export function useSSE(callbacks?: {
         throttledNodeStatus()
       } else if (data.type === 'partition_changed') {
         throttledPartition()
+      } else if (data.type === 'partition_auto' && callbacksRef.current?.onPartitionAuto) {
+        callbacksRef.current.onPartitionAuto({
+          partitions: data.partitions ?? [],
+          radius_m: data.radius_m ?? 0,
+        })
+      } else if (data.type === 'game_state_changed' && callbacksRef.current?.onGameStateChanged) {
+        callbacksRef.current.onGameStateChanged(data.label, data.snapshot)
+      } else if (data.type === 'rule_violated' && callbacksRef.current?.onRuleViolated) {
+        callbacksRef.current.onRuleViolated({
+          label: data.label,
+          rule_id: data.rule_id,
+          reason: data.reason,
+        })
       }
     }
 

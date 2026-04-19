@@ -7,8 +7,13 @@ import { EventLog } from '@/components/EventLog'
 import { NetworkGraph } from '@/components/NetworkGraph'
 import { NodeControl } from '@/components/NodeControl'
 import { FinalityChart } from '@/components/FinalityChart'
+import { GameView } from '@/components/GameView'
+import { GameSelectOverlay } from '@/components/GameSelectOverlay'
+import { ConsensusStalledBanner } from '@/components/ConsensusStalledBanner'
 import { Button } from '@/components/ui/button'
 import { useAgentStates, useProofs, useEventLog, useNodes, usePartitions, useSSE } from '@/hooks/useApi'
+import { useGameActions, useGames, useGameState } from '@/hooks/useGame'
+import type { LocalGameSnapshot } from '@/game/types'
 import { Wifi, WifiOff, Trash2, Terminal } from 'lucide-react'
 
 export default function App() {
@@ -17,6 +22,9 @@ export default function App() {
   const { events, appendEvent, clearEvents } = useEventLog()
   const { nodes, startNode, stopNode, setRole, createSwarm, destroySwarm, refetch: refetchNodes } = useNodes()
   const { partitions, togglePartition, refetch: refetchPartitions } = usePartitions()
+  const { snapshots, applySnapshotUpdate, clear: clearGameState } = useGameState()
+  const { games } = useGames()
+  const { moveEntity, proposeGame, voteGame, claimEntity, readyUp } = useGameActions()
   const [eventLogOpen, setEventLogOpen] = useState(false)
 
   const handleUpdate = useCallback(() => {
@@ -28,6 +36,7 @@ export default function App() {
   async function handleClearArtifacts() {
     await fetch('/api/clear-artifacts', { method: 'POST' })
     clearEvents()
+    clearGameState()
     refetchNodes()
     refetchStates()
     refetchProofs()
@@ -38,6 +47,8 @@ export default function App() {
     onUpdate: handleUpdate,
     onNodeStatus: refetchNodes,
     onPartitionChanged: refetchPartitions,
+    onGameStateChanged: (label, snapshot) =>
+      applySnapshotUpdate(label, snapshot as LocalGameSnapshot),
   })
 
   return (
@@ -96,11 +107,15 @@ export default function App() {
                 nodes={nodes}
                 states={states}
                 events={events}
+                snapshots={snapshots}
+                games={games}
                 onStart={startNode}
                 onStop={stopNode}
                 onSetRole={setRole}
                 onCreateSwarm={createSwarm}
                 onDestroySwarm={destroySwarm}
+                onClaimEntity={claimEntity}
+                onReadyUp={readyUp}
               />
             </div>
             <div className="w-1/3 shrink-0">
@@ -108,7 +123,26 @@ export default function App() {
             </div>
           </div>
 
+          {/* Game selection — full width, above the playing field */}
+          <GameSelectOverlay
+            nodes={nodes}
+            snapshots={snapshots}
+            games={games}
+            onPropose={proposeGame}
+            onVote={voteGame}
+          />
+
+          {/* Playing field — full width */}
+          <GameView
+            nodes={nodes}
+            snapshots={snapshots}
+            games={games}
+            onMove={moveEntity}
+            partitions={partitions}
+          />
+
           {/* Consensus finality — full width */}
+          <ConsensusStalledBanner proofs={proofs} partitions={partitions} />
           <FinalityChart events={events} />
 
           {/* Proofs / Timeline */}

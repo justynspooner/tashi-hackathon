@@ -21,6 +21,18 @@ const TAG_COLORS: Record<string, string> = {
   VERTEX_RX: 'bg-sky-500',
   VERTEX_ERR: 'bg-red-700',
   CMD: 'bg-pink-500',
+  // Demo-critical tags — call them out visually so rule-rejection and
+  // game-phase events jump off the log during the verification script.
+  RULE_VIOLATION: 'bg-red-600',
+  RULE: 'bg-fuchsia-500',
+  GAME_EVENT: 'bg-violet-500',
+  SENSOR: 'bg-emerald-500',
+  FINALITY: 'bg-purple-500',
+}
+
+/** Tags we want a coloured row background for (beyond the coloured chip). */
+const ROW_HIGHLIGHT: Record<string, string> = {
+  RULE_VIOLATION: 'bg-red-950/30 hover:bg-red-950/50',
 }
 
 function labelColor(label: string): string {
@@ -137,7 +149,9 @@ export const EventLog = memo(function EventLog({ events: rawEvents, onClear }: {
                 {visibleEvents.map((event, i) => (
                   <div
                     key={startIdx + i}
-                    className="flex items-center gap-2 px-2 hover:bg-muted/50"
+                    className={`flex items-center gap-2 px-2 ${
+                      ROW_HIGHLIGHT[event.tag] ?? 'hover:bg-muted/50'
+                    }`}
                     style={{ height: ROW_HEIGHT }}
                   >
                     <span className="text-muted-foreground shrink-0 w-[82px]">

@@ -29,9 +29,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Power, PowerOff, Server, Plus, Trash2 } from 'lucide-react'
+import { Power, PowerOff, Server, Plus, Trash2, Check, Flag } from 'lucide-react'
 import { timeSince, roleColor } from '@/lib/utils'
 import type { AgentState, EventLogEntry, NodeInfo } from '@/types'
+import type {
+  EntityRecord,
+  GameConfig,
+  GamePhase,
+  LocalGameSnapshot,
+} from '@/game/types'
+import { teamColor } from '@/game/presentation'
 
 const AVAILABLE_ROLES = ['carrier', 'scout', 'observer', 'relay']
 
@@ -53,6 +60,63 @@ const TAG_COLORS: Record<string, string> = {
 
 function shortId(id: string): string {
   return id.slice(-4)
+}
+
+// --- Phase + entity helpers ---
+
+const PHASE_LABELS: Record<GamePhase, string> = {
+  no_game: 'no game',
+  proposing: 'proposing',
+  voting: 'voting',
+  loaded: 'loaded',
+  placing_entities: 'placing',
+  ready: 'ready',
+  counting_down: 'countdown',
+  playing: 'playing',
+  ended: 'ended',
+}
+
+const PHASE_COLORS: Record<GamePhase, string> = {
+  no_game: 'bg-slate-500/20 text-slate-300',
+  proposing: 'bg-amber-500/20 text-amber-300',
+  voting: 'bg-amber-500/20 text-amber-300',
+  loaded: 'bg-cyan-500/20 text-cyan-300',
+  placing_entities: 'bg-cyan-500/20 text-cyan-300',
+  ready: 'bg-emerald-500/20 text-emerald-300',
+  counting_down: 'bg-emerald-500/20 text-emerald-300',
+  playing: 'bg-emerald-500/20 text-emerald-300',
+  ended: 'bg-purple-500/20 text-purple-300',
+}
+
+function entityGlyph(entityType: string | null | undefined): string {
+  switch (entityType) {
+    case 'flag': return '🚩'
+    case 'base': return '🏰'
+    case 'player': return '🟢'
+    case 'hill': return '⛰️'
+    case 'zone': return '⬛'
+    default: return '●'
+  }
+}
+
+/// Count existing claims for an (entity_type, team) tuple, excluding a
+/// specific peer_id (so re-claims by the same node don't count against
+/// themselves — mirrors rules.rs::count_claims).
+function countClaims(
+  entities: Record<string, EntityRecord>,
+  entityType: string,
+  team: string | null,
+  excludePeerId?: string,
+): number {
+  let n = 0
+  for (const e of Object.values(entities)) {
+    if (excludePeerId && e.peer_id === excludePeerId) continue
+    if (e.entity_type !== entityType) continue
+    const eTeam = e.team ?? null
+    if (eTeam !== team) continue
+    n += 1
+  }
+  return n
 }
 
 function shortMessageId(id: string | null | undefined): string {
@@ -112,6 +176,209 @@ function NodeEventLog({ events }: { events: EventLogEntry[] }) {
   )
 }
 
+// --- Game controls section (entity claim + ready-up) ---
+
+interface NodeGameControlsProps {
+  node: NodeInfo
+  snapshot?: LocalGameSnapshot
+  activeGame?: GameConfig
+  canonicalEntities: Record<string, EntityRecord>
+  onClaimEntity: (label: string, entityType: string, team: string | null) => Promise<void>
+  onReadyUp: (label: string) => Promise<void>
+}
+
+function NodeGameControls({
+  node,
+  snapshot,
+  activeGame,
+  canonicalEntities,
+  onClaimEntity,
+  onReadyUp,
+}: NodeGameControlsProps) {
+  const [claiming, setClaiming] = useState(false)
+  const [readying, setReadying] = useState(false)
+  const [selectedType, setSelectedType] = useState<string>('')
+  const [selectedTeam, setSelectedTeam] = useState<string>('')
+
+  const phase = snapshot?.phase ?? 'no_game'
+  const myPeerId = snapshot?.peer_id
+  const myEntity = snapshot ? snapshot.entities[node.label] : undefined
+  const hasClaimed = !!myEntity?.entity_type
+  const isReady = !!myPeerId && (snapshot?.ready_peers ?? []).includes(myPeerId)
+  const placementOk = !!snapshot?.placement_ok
+
+  // Nothing to show before a game is loaded, or once in the proposal/vote
+  // phases (GameSelectOverlay owns those).
+  if (!activeGame || phase === 'no_game' || phase === 'proposing' || phase === 'voting') {
+    return null
+  }
+
+  // Teams the currently-selected entity type supports.
+  const selectedTypeDef = activeGame.entity_types.find(t => t.id === selectedType)
+  const needsTeam = selectedTypeDef?.team === 'per_team'
+  const teamOptions: Array<string | null> = needsTeam ? activeGame.teams : [null]
+
+  // An entity_type option is disabled when *every* valid team slot for it is
+  // already filled. For teamless types there's one slot; for `per_team` types,
+  // each team is a slot.
+  function isTypeExhausted(typeId: string): boolean {
+    const td = activeGame!.entity_types.find(t => t.id === typeId)
+    if (!td) return true
+    const teams: Array<string | null> = td.team === 'per_team' ? activeGame!.teams : [null]
+    return teams.every(t => countClaims(canonicalEntities, typeId, t, myPeerId) >= td.max)
+  }
+
+  function isTeamExhausted(typeId: string, team: string | null): boolean {
+    const td = activeGame!.entity_types.find(t => t.id === typeId)
+    if (!td) return true
+    return countClaims(canonicalEntities, typeId, team, myPeerId) >= td.max
+  }
+
+  async function handleClaim() {
+    if (!selectedType) return
+    if (needsTeam && !selectedTeam) return
+    setClaiming(true)
+    try {
+      await onClaimEntity(
+        node.label,
+        selectedType,
+        needsTeam ? selectedTeam : null,
+      )
+    } finally {
+      setClaiming(false)
+    }
+  }
+
+  async function handleReady() {
+    setReadying(true)
+    try {
+      await onReadyUp(node.label)
+    } finally {
+      setReadying(false)
+    }
+  }
+
+  // After-claim display: show the node's entity + ready-up button.
+  if (hasClaimed) {
+    const teamStr = myEntity?.team ?? null
+    return (
+      <div className="border-t pt-1 space-y-1">
+        <div className="flex items-center gap-1 text-[10px]">
+          <span className="text-muted-foreground">Entity:</span>
+          <span>{entityGlyph(myEntity?.entity_type)}</span>
+          <span className="font-medium">{myEntity?.entity_type}</span>
+          {teamStr && (
+            <span
+              className="px-1 rounded text-[9px] font-semibold"
+              style={{ backgroundColor: teamColor(teamStr) + '30', color: teamColor(teamStr) }}
+            >
+              {teamStr}
+            </span>
+          )}
+        </div>
+        {phase === 'placing_entities' && (
+          isReady ? (
+            <Badge variant="outline" className="h-5 text-[10px] bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+              <Check className="h-2.5 w-2.5 mr-0.5" />
+              Ready
+            </Badge>
+          ) : (
+            <Button
+              size="sm"
+              className="h-5 text-[10px] px-2 w-full"
+              disabled={readying || !placementOk}
+              onClick={handleReady}
+              title={placementOk ? 'Signal readiness' : 'Move entity into a valid placement first'}
+            >
+              {readying ? 'Signalling…' : placementOk ? 'Ready Up' : 'Placement invalid'}
+            </Button>
+          )
+        )}
+        {phase === 'ready' && (
+          <Badge variant="outline" className="h-5 text-[10px] bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+            <Check className="h-2.5 w-2.5 mr-0.5" />
+            Ready
+          </Badge>
+        )}
+      </div>
+    )
+  }
+
+  // Claim form: only during loaded/placing_entities with no prior claim.
+  if (phase !== 'loaded' && phase !== 'placing_entities') {
+    return null
+  }
+
+  return (
+    <div className="border-t pt-1 space-y-1">
+      <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+        <Flag className="h-2.5 w-2.5" />
+        <span>Claim entity</span>
+      </div>
+      <div className="flex gap-1">
+        <Select
+          value={selectedType}
+          onValueChange={value => {
+            setSelectedType(value ?? '')
+            setSelectedTeam('')
+          }}
+        >
+          <SelectTrigger className="h-5 text-[10px] flex-1 px-1.5">
+            <SelectValue placeholder="type" />
+          </SelectTrigger>
+          <SelectContent>
+            {activeGame.entity_types.map(et => {
+              const exhausted = isTypeExhausted(et.id)
+              return (
+                <SelectItem key={et.id} value={et.id} disabled={exhausted}>
+                  <span className="flex items-center gap-1">
+                    <span>{entityGlyph(et.id)}</span>
+                    <span>{et.id}</span>
+                    {exhausted && <span className="text-[9px] text-muted-foreground">(full)</span>}
+                  </span>
+                </SelectItem>
+              )
+            })}
+          </SelectContent>
+        </Select>
+        {needsTeam && (
+          <Select
+            value={selectedTeam}
+            onValueChange={value => setSelectedTeam(value ?? '')}
+          >
+            <SelectTrigger className="h-5 text-[10px] flex-1 px-1.5">
+              <SelectValue placeholder="team" />
+            </SelectTrigger>
+            <SelectContent>
+              {teamOptions.filter((t): t is string => !!t).map(team => {
+                const exhausted = isTeamExhausted(selectedType, team)
+                return (
+                  <SelectItem key={team} value={team} disabled={exhausted}>
+                    <span
+                      className="px-1 rounded text-[9px] font-semibold"
+                      style={{ backgroundColor: teamColor(team) + '30', color: teamColor(team) }}
+                    >
+                      {team}{exhausted ? ' (full)' : ''}
+                    </span>
+                  </SelectItem>
+                )
+              })}
+            </SelectContent>
+          </Select>
+        )}
+      </div>
+      <Button
+        size="sm"
+        className="h-5 text-[10px] px-2 w-full"
+        disabled={claiming || !selectedType || (needsTeam && !selectedTeam)}
+        onClick={handleClaim}
+      >
+        {claiming ? 'Claiming…' : 'Claim'}
+      </Button>
+    </div>
+  )
+}
+
 // --- Single node card ---
 
 const NodeCard = memo(function NodeCard({
@@ -121,9 +388,14 @@ const NodeCard = memo(function NodeCard({
   loading,
   peerIdToLabel,
   now,
+  snapshot,
+  activeGame,
+  canonicalEntities,
   onStart,
   onStop,
   onSetRole,
+  onClaimEntity,
+  onReadyUp,
 }: {
   node: NodeInfo
   agentState?: AgentState
@@ -131,10 +403,16 @@ const NodeCard = memo(function NodeCard({
   loading: boolean
   peerIdToLabel: Record<string, string>
   now: number
+  snapshot?: LocalGameSnapshot
+  activeGame?: GameConfig
+  canonicalEntities: Record<string, EntityRecord>
   onStart: (label: string) => void
   onStop: (label: string) => void
   onSetRole: (label: string, role: string) => void
+  onClaimEntity: (label: string, entityType: string, team: string | null) => Promise<void>
+  onReadyUp: (label: string) => Promise<void>
 }) {
+  const phase: GamePhase = snapshot?.phase ?? 'no_game'
   return (
     <Card className="w-56 shrink-0 flex flex-col">
       <CardHeader className="py-2 px-3">
@@ -142,6 +420,11 @@ const NodeCard = memo(function NodeCard({
           <div className={`w-2 h-2 rounded-full shrink-0 ${node.status === 'running' ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`} />
           <span className="font-medium text-sm">{node.label}</span>
           <span className="text-[10px] text-muted-foreground">{node.bind}</span>
+          {node.status === 'running' && phase !== 'no_game' && (
+            <span className={`text-[9px] font-semibold px-1 rounded ${PHASE_COLORS[phase]}`}>
+              {PHASE_LABELS[phase]}
+            </span>
+          )}
           <div className="ml-auto flex items-center gap-1">
             {node.status === 'running' ? (
               <Button size="sm" variant="destructive" className="h-5 w-5 p-0" disabled={loading} onClick={() => onStop(node.label)}>
@@ -195,6 +478,15 @@ const NodeCard = memo(function NodeCard({
           </div>
         )}
 
+        <NodeGameControls
+          node={node}
+          snapshot={snapshot}
+          activeGame={activeGame}
+          canonicalEntities={canonicalEntities}
+          onClaimEntity={onClaimEntity}
+          onReadyUp={onReadyUp}
+        />
+
         <div className="border-t pt-1 mt-auto">
           <NodeEventLog events={events} />
         </div>
@@ -209,14 +501,31 @@ interface Props {
   nodes: NodeInfo[]
   states: AgentState[]
   events: EventLogEntry[]
+  snapshots: Record<string, LocalGameSnapshot>
+  games: GameConfig[]
   onStart: (label: string) => Promise<void>
   onStop: (label: string) => Promise<void>
   onSetRole: (label: string, role: string) => Promise<void>
   onCreateSwarm: (count: number) => Promise<void>
   onDestroySwarm: () => Promise<void>
+  onClaimEntity: (label: string, entityType: string, team: string | null) => Promise<void>
+  onReadyUp: (label: string) => Promise<void>
 }
 
-export const NodeControl = memo(function NodeControl({ nodes, states, events, onStart, onStop, onSetRole, onCreateSwarm, onDestroySwarm }: Props) {
+export const NodeControl = memo(function NodeControl({
+  nodes,
+  states,
+  events,
+  snapshots,
+  games,
+  onStart,
+  onStop,
+  onSetRole,
+  onCreateSwarm,
+  onDestroySwarm,
+  onClaimEntity,
+  onReadyUp,
+}: Props) {
   const [loading, setLoading] = useState<Record<string, boolean>>({})
   const [swarmSizeInput, setSwarmSizeInput] = useState('7')
   const [swarmDialogOpen, setSwarmDialogOpen] = useState(false)
@@ -251,6 +560,34 @@ export const NodeControl = memo(function NodeControl({ nodes, states, events, on
     }
     return map
   }, [states])
+
+  // Resolve the currently-active game from snapshots. Nodes converge via
+  // consensus, so any non-empty `active_game_id` across snapshots is
+  // authoritative; ties shouldn't happen in practice.
+  const activeGame = useMemo<GameConfig | undefined>(() => {
+    for (const snap of Object.values(snapshots)) {
+      if (snap.active_game_id) {
+        return games.find(g => g.id === snap.active_game_id)
+      }
+    }
+    return undefined
+  }, [snapshots, games])
+
+  // Canonical view of all entity claims across snapshots. Each node's
+  // snapshot should converge to the same set; we merge by label, preferring
+  // the richest (i.e. `entity_type`-set) record.
+  const canonicalEntities = useMemo<Record<string, EntityRecord>>(() => {
+    const out: Record<string, EntityRecord> = {}
+    for (const snap of Object.values(snapshots)) {
+      for (const [label, rec] of Object.entries(snap.entities)) {
+        const existing = out[label]
+        if (!existing || (!existing.entity_type && rec.entity_type)) {
+          out[label] = rec
+        }
+      }
+    }
+    return out
+  }, [snapshots])
 
   const allRunning = nodes.length > 0 && nodes.every(n => n.status === 'running')
 
@@ -376,9 +713,14 @@ export const NodeControl = memo(function NodeControl({ nodes, states, events, on
               loading={!!loading[node.label]}
               peerIdToLabel={peerIdToLabel}
               now={now}
+              snapshot={snapshots[node.label]}
+              activeGame={activeGame}
+              canonicalEntities={canonicalEntities}
               onStart={handleStart}
               onStop={handleStop}
               onSetRole={onSetRole}
+              onClaimEntity={onClaimEntity}
+              onReadyUp={onReadyUp}
             />
           ))}
         </div>
