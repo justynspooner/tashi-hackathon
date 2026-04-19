@@ -209,27 +209,40 @@ export function GameView({ nodes, snapshots, games, onMove, partitions }: GameVi
       return clampToField({ x: fromPxX(xPx), y: fromPxY(yPx) })
     }
 
+    // React owns the entity DOM, so `.call(drag)` can't rely on `__data__`
+    // being bound (it isn't — React doesn't set it). Read the label from the
+    // `data-label` attribute stamped onto each `g.entity-group` instead.
+    // Stopped nodes have `data-running="false"` — filter those out at the
+    // d3.drag level so we don't start an interaction that can't be applied.
     const drag = d3
-      .drag<SVGGElement, EntityView>()
+      .drag<SVGGElement, unknown>()
+      .filter(function () {
+        const el = this as SVGGElement
+        return el.getAttribute('data-running') !== 'false'
+      })
       .on('start', function () {
         d3.select(this).raise().classed('dragging', true)
       })
-      .on('drag', function (event, d) {
+      .on('drag', function (event) {
+        const label = (this as SVGGElement).getAttribute('data-label')
+        if (!label) return
         const p = toFieldM(event)
-        setDragOverrides(prev => ({ ...prev, [d.label]: p }))
+        setDragOverrides(prev => ({ ...prev, [label]: p }))
       })
-      .on('end', function (event, d) {
+      .on('end', function (event) {
         d3.select(this).classed('dragging', false)
+        const label = (this as SVGGElement).getAttribute('data-label')
+        if (!label) return
         const p = toFieldM(event)
         setDragOverrides(prev => {
           const copy = { ...prev }
-          delete copy[d.label]
+          delete copy[label]
           return copy
         })
-        void onMove(d.label, p.x, p.y)
+        void onMove(label, p.x, p.y)
       })
 
-    svg.selectAll<SVGGElement, EntityView>('g.entity-group').call(drag)
+    svg.selectAll<SVGGElement, unknown>('g.entity-group').call(drag)
 
     return () => {
       svg.on('.zoom', null)
@@ -580,6 +593,7 @@ function EntityGlyph({
     <g
       className="entity-group"
       data-label={datum.label}
+      data-running={entity.running ? 'true' : 'false'}
       transform={`translate(${x}, ${y})`}
       style={{ cursor: entity.running ? 'grab' : 'not-allowed', opacity }}
     >
