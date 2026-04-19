@@ -1,0 +1,28 @@
+{
+  "id": "territory",
+  "name": "Territory Control",
+  "comm_radius_m": 9.0,
+  "teams": ["red", "blue"],
+  "entity_types": [
+    { "id": "zone",   "min": 2, "max": 3, "team": null,       "visual": "zone" },
+    { "id": "player", "min": 2, "max": 4, "team": "per_team", "visual": "player" }
+  ],
+  "placement": [],
+  "rules": [
+    {
+      "id": "claim_zone",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "player" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "zone", "max_m": 2.5, "min_s": 4 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "zone", "key": "owner_team", "value": "self.team" }
+    },
+    {
+      "id": "score_zone",
+      "on": "game_state_delta",
+      "when": { "kind": "property_changed", "target_entity_type": "zone", "key": "owner_team" },
+      "effect": { "kind": "increment_score", "team": "self.team", "by": 1 }
+    }
+  ]
+}

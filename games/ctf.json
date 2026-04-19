@@ -1,0 +1,38 @@
+{
+  "id": "ctf",
+  "name": "Capture the Flag",
+  "comm_radius_m": 8.0,
+  "teams": ["red", "blue"],
+  "entity_types": [
+    { "id": "flag",   "min": 1, "max": 1, "team": null,       "visual": "flag" },
+    { "id": "base",   "min": 1, "max": 1, "team": "per_team", "visual": "base" },
+    { "id": "player", "min": 2, "max": 4, "team": "per_team", "visual": "player" }
+  ],
+  "placement": [
+    { "entity": "player", "requires": { "kind": "within_m_of",        "entity": "base", "same_team": true, "max_m": 2.0 } },
+    { "entity": "flag",   "requires": { "kind": "farther_than_m_from", "entity": "base",                   "min_m": 20.0 } }
+  ],
+  "rules": [
+    {
+      "id": "flag_capture",
+      "on": "sensor_reading",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "player" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 10 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "flag", "key": "owner_team", "value": "self.team" }
+    },
+    {
+      "id": "score_capture",
+      "on": "game_state_delta",
+      "when": { "kind": "property_changed", "target_entity_type": "flag", "key": "owner_team" },
+      "effect": { "kind": "increment_score", "team": "self.team", "by": 1 }
+    },
+    {
+      "id": "capture_wins",
+      "on": "game_state_delta",
+      "when": { "kind": "property_changed", "target_entity_type": "flag", "key": "owner_team" },
+      "effect": { "kind": "end_game", "winner_team": "self.team", "reason": "first flag capture" }
+    }
+  ]
+}

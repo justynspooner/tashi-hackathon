@@ -8,12 +8,21 @@ pub struct SharedState {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     Hello,
     Heartbeat,
     StateUpdate,
+    // Game-related (Phase A+)
+    GameProposal,
+    GameVote,
+    EntityTypeClaim,
+    SensorReading,
+    ReadyUp,
+    GameStateDelta,
+    RuleViolation,
+    GameEnd,
 }
 
 impl MessageKind {
@@ -22,8 +31,71 @@ impl MessageKind {
             Self::Hello => "hello",
             Self::Heartbeat => "heartbeat",
             Self::StateUpdate => "state_update",
+            Self::GameProposal => "game_proposal",
+            Self::GameVote => "game_vote",
+            Self::EntityTypeClaim => "entity_type_claim",
+            Self::SensorReading => "sensor_reading",
+            Self::ReadyUp => "ready_up",
+            Self::GameStateDelta => "game_state_delta",
+            Self::RuleViolation => "rule_violation",
+            Self::GameEnd => "game_end",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorDatum {
+    pub peer_id: String,
+    pub distance_m: f32,
+    pub angle_rad: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatePatch {
+    pub target_peer_id: String,
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// Game-event payload carried on a `WireMessage`. Only certain `MessageKind`
+/// variants set this; older Hello/Heartbeat/StateUpdate leave it `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GamePayload {
+    GameProposal {
+        game_id: String,
+    },
+    GameVote {
+        game_id: String,
+    },
+    EntityTypeClaim {
+        entity_type: String,
+        team: Option<String>,
+    },
+    SensorReading {
+        pos: Position,
+        readings: Vec<SensorDatum>,
+        observed_at_ms: u64,
+    },
+    ReadyUp,
+    GameStateDelta {
+        patches: Vec<StatePatch>,
+    },
+    RuleViolation {
+        rule_id: String,
+        offender_msg_id: String,
+        reason: String,
+    },
+    GameEnd {
+        winner_team: Option<String>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,4 +105,8 @@ pub struct WireMessage {
     pub sent_at_ms: u64,
     pub state: SharedState,
     pub note: Option<String>,
+    /// Present for `MessageKind`s that carry a game payload; absent for
+    /// Hello/Heartbeat/StateUpdate so older JSON remains parseable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<GamePayload>,
 }

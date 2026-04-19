@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,9 +17,15 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 
-use crate::pf::PfPartitionManager;
+use crate::defaults::{
+    FIELD_HEIGHT_M, FIELD_WIDTH_M, HYSTERESIS_M, MIN_SEP_M, PRE_GAME_COMM_RADIUS_M,
+    RECONCILER_TICK_MS,
+};
+use crate::games::{self, GameConfig};
+use crate::geom;
+use crate::pf::{normalize_pair, PfPartitionManager, PortPair};
 use crate::proof::ProofOfCoordination;
-use crate::protocol::SharedState;
+use crate::protocol::{Position, SharedState};
 use crate::state::now_ms;
 
 // --- Config types ---
@@ -31,6 +37,10 @@ struct NodeConfig {
     secret: String,
     pubkey: String,
     role: String,
+    #[serde(default)]
+    initial_x: Option<f32>,
+    #[serde(default)]
+    initial_y: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +82,8 @@ struct NodeInfoResponse {
     bind: String,
     role: Option<String>,
     status: String,
+    initial_x: Option<f32>,
+    initial_y: Option<f32>,
 }
 
 // --- Internal state ---
@@ -80,6 +92,12 @@ struct NodeInfoResponse {
 struct NodeHandle {
     child: tokio::process::Child,
     cmd_file: PathBuf,
+}
+
+#[derive(Clone)]
+struct GamesState {
+    dir: PathBuf,
+    configs: HashMap<String, GameConfig>,
 }
 
 struct AppState {
@@ -97,6 +115,13 @@ struct AppState {
     proof_counts: Mutex<HashMap<String, usize>>,
     /// Packet filter manager for network partition simulation.
     pf: PfPartitionManager,
+    /// Latest per-node game-state snapshot (the content of `{label}-game.json`),
+    /// refreshed by the file watcher. Keyed by label.
+    game_snapshots: Mutex<HashMap<String, serde_json::Value>>,
+    /// Per-node mtime of `{label}-game.json` to detect changes.
+    game_file_mtimes: Mutex<HashMap<String, std::time::SystemTime>>,
+    /// Pre-installed game configs loaded at startup.
+    games: GamesState,
 }
 
 // --- Server entry point ---
@@ -107,6 +132,17 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     std::fs::create_dir_all(&artifacts_dir)?;
     let config_path = artifacts_dir.join("node-config.json");
     let config = load_or_create_config(&config_path)?;
+
+    let games_dir = project_root.join("games");
+    let game_configs = games::load_all(&games_dir).unwrap_or_else(|e| {
+        eprintln!("[games] failed to load from {}: {e:#}", games_dir.display());
+        HashMap::new()
+    });
+    println!(
+        "Loaded {} game config(s): {}",
+        game_configs.len(),
+        game_configs.keys().cloned().collect::<Vec<_>>().join(", "),
+    );
 
     let (sse_tx, _) = broadcast::channel::<String>(256);
 
@@ -122,6 +158,9 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         log_offsets: Mutex::new(HashMap::new()),
         proof_counts: Mutex::new(HashMap::new()),
         pf: PfPartitionManager::new(),
+        game_snapshots: Mutex::new(HashMap::new()),
+        game_file_mtimes: Mutex::new(HashMap::new()),
+        games: GamesState { dir: games_dir, configs: game_configs },
     });
 
     load_existing_artifacts(&state, &artifacts_dir);
@@ -130,6 +169,12 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
     let state2 = state.clone();
     tokio::spawn(async move {
         file_watcher(state2).await;
+    });
+
+    // Partition reconciler task — keeps pfctl rules in sync with spatial state.
+    let state3 = state.clone();
+    tokio::spawn(async move {
+        partition_reconciler(state3).await;
     });
 
     let app = Router::new()
@@ -142,6 +187,13 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         .route("/api/nodes/{label}/start", post(start_node))
         .route("/api/nodes/{label}/stop", post(stop_node))
         .route("/api/nodes/{label}/role", post(set_role))
+        .route("/api/nodes/{label}/position", post(set_position))
+        .route("/api/nodes/{label}/propose-game/{game_id}", post(propose_game))
+        .route("/api/nodes/{label}/vote-game/{game_id}", post(vote_game))
+        .route("/api/nodes/{label}/entity-type", post(claim_entity))
+        .route("/api/nodes/{label}/ready", post(ready_up))
+        .route("/api/game-state", get(get_game_snapshots))
+        .route("/api/games", get(get_games))
         .route("/api/swarm", post(create_swarm).delete(destroy_swarm))
         .route("/api/partitions", get(get_partitions))
         .route("/api/partitions/create", post(create_partition))
@@ -250,6 +302,22 @@ async fn file_watcher(state: Arc<AppState>) {
                                 if entry.tag == "VERTEX_RX" || entry.tag == "VERTEX_TX" {
                                     continue;
                                 }
+                                // Fan out a dedicated SSE discriminant for
+                                // RULE_VIOLATION entries. The log entry
+                                // itself still flows through `event_log`
+                                // below; the banner / violation UI consumes
+                                // `rule_violated` for structured access.
+                                if entry.tag == "RULE_VIOLATION" {
+                                    let (rule_id, reason) = parse_violation(&entry.message);
+                                    let _ = state.sse_tx.send(
+                                        serde_json::json!({
+                                            "type": "rule_violated",
+                                            "label": entry.label,
+                                            "rule_id": rule_id,
+                                            "reason": reason,
+                                        }).to_string(),
+                                    );
+                                }
                                 let _ = state.sse_tx.send(
                                     serde_json::json!({
                                         "type": "event_log",
@@ -264,6 +332,36 @@ async fn file_watcher(state: Arc<AppState>) {
                             }
                         }
                         state.log_offsets.lock().unwrap().insert(label.clone(), file_len);
+                    }
+                }
+            }
+
+            // Read game-state file (positions + phase + entities)
+            let game_file = state.project_root.join(format!("artifacts/{label}-game.json"));
+            if game_file.exists() {
+                if let Ok(meta) = std::fs::metadata(&game_file) {
+                    if let Ok(modified) = meta.modified() {
+                        let changed = {
+                            let mtimes = state.game_file_mtimes.lock().unwrap();
+                            mtimes.get(label).copied() != Some(modified)
+                        };
+                        if changed {
+                            if let Ok(data) = std::fs::read_to_string(&game_file) {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&data) {
+                                    state.game_snapshots.lock().unwrap().insert(label.clone(), val.clone());
+                                    state.game_file_mtimes.lock().unwrap().insert(label.clone(), modified);
+                                    let _ = state.sse_tx.send(
+                                        serde_json::json!({
+                                            "type": "game_state_changed",
+                                            "label": label,
+                                            "snapshot": val,
+                                        })
+                                        .to_string(),
+                                    );
+                                    any_update = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -336,6 +434,261 @@ async fn file_watcher(state: Arc<AppState>) {
             let _ = state.sse_tx.send(
                 serde_json::json!({"type": "update", "ts": now_ms()}).to_string(),
             );
+        }
+    }
+}
+
+/// Extract `(rule_id, reason)` from a RULE_VIOLATION log message of the form
+/// `"[rule_id] ... rejected: reason"` (see `report_violation` in node.rs).
+/// Best-effort — unparseable forms return the whole message as `reason`.
+fn parse_violation(message: &str) -> (String, String) {
+    // Accept either "[rule_id] msg_id from peer rejected: reason"
+    // or      "[rule_id] from peer: reason"  (observer-side formatting).
+    let (rule, rest) = match (message.strip_prefix('['), message.find(']')) {
+        (Some(_), Some(idx)) => (
+            message[1..idx].to_string(),
+            message.get(idx + 1..).unwrap_or("").trim_start().to_string(),
+        ),
+        _ => (String::new(), message.to_string()),
+    };
+    let reason = if let Some((_, after)) = rest.split_once("rejected: ") {
+        after.to_string()
+    } else if let Some((_, after)) = rest.split_once(": ") {
+        after.to_string()
+    } else {
+        rest
+    };
+    (rule, reason)
+}
+
+// --- Partition reconciler: auto-sync pfctl with spatial state ---
+
+/// Extract `(label, Position)` pairs from the latest per-node snapshots. A node
+/// appears once at its best-known position (prefer its own `my_position`, then
+/// any peer's view of it, finally its node-config initial position).
+fn snapshot_positions(state: &AppState) -> Vec<(String, Position)> {
+    let snaps = state.game_snapshots.lock().unwrap();
+    let config = state.config.lock().unwrap();
+    let mut out: Vec<(String, Position)> = Vec::new();
+
+    // Start with the config (so nodes that haven't produced a snapshot yet —
+    // e.g. stopped nodes with `initial_x/y` persisted — still appear).
+    for n in &config.nodes {
+        if let (Some(x), Some(y)) = (n.initial_x, n.initial_y) {
+            out.push((n.label.clone(), Position { x, y }));
+        }
+    }
+
+    // Override with snapshot-derived positions where available.
+    for (label, snap) in snaps.iter() {
+        let pos_val = snap
+            .get("my_position")
+            .cloned()
+            .or_else(|| snap.get("entities").and_then(|e| e.get(label.as_str())).and_then(|e| e.get("pos")).cloned());
+        if let Some(pv) = pos_val {
+            let x = pv.get("x").and_then(|v| v.as_f64());
+            let y = pv.get("y").and_then(|v| v.as_f64());
+            if let (Some(xf), Some(yf)) = (x, y) {
+                if let Some(entry) = out.iter_mut().find(|(l, _)| l == label) {
+                    entry.1 = Position { x: xf as f32, y: yf as f32 };
+                } else {
+                    out.push((label.clone(), Position { x: xf as f32, y: yf as f32 }));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Map label -> UDP port (from the current node-config).
+fn label_port_map(state: &AppState) -> HashMap<String, u16> {
+    let config = state.config.lock().unwrap();
+    let mut map = HashMap::new();
+    for n in &config.nodes {
+        if let Some(port_str) = n.bind.rsplit(':').next() {
+            if let Ok(port) = port_str.parse::<u16>() {
+                map.insert(n.label.clone(), port);
+            }
+        }
+    }
+    map
+}
+
+/// Pick the majority `active_game_id` across the supplied snapshots. Nodes
+/// converge to the same id via consensus once a game is loaded, so the tally
+/// is usually unanimous; ties are broken lexicographically for determinism.
+/// Returns `None` when no snapshot has a non-empty id.
+fn majority_active_game_id<'a, I>(snapshots: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a serde_json::Value>,
+{
+    let mut tally: HashMap<String, u32> = HashMap::new();
+    for snap in snapshots {
+        if let Some(id) = snap.get("active_game_id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                *tally.entry(id.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    tally
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(id, _)| id)
+}
+
+/// Resolve the communication radius currently in effect. When a game is
+/// loaded on the majority of nodes, its `comm_radius_m` wins; otherwise we
+/// fall back to the pre-game default.
+fn resolve_comm_radius(
+    active_id: Option<&str>,
+    configs: &HashMap<String, GameConfig>,
+) -> f32 {
+    active_id
+        .and_then(|id| configs.get(id))
+        .map(|cfg| cfg.comm_radius_m)
+        .unwrap_or(PRE_GAME_COMM_RADIUS_M)
+}
+
+fn active_comm_radius(state: &AppState) -> f32 {
+    let snaps = state.game_snapshots.lock().unwrap();
+    let active = majority_active_game_id(snaps.values());
+    drop(snaps);
+    resolve_comm_radius(active.as_deref(), &state.games.configs)
+}
+
+/// Convert the live `pfctl`-blocked port set into label-pair form so the
+/// hysteresis check can look up a pair's current state without needing the
+/// port table again. Pairs involving unknown labels (e.g. stopped nodes with
+/// stale port mappings) are silently dropped — they'll be rediscovered on
+/// the next reconciler pass.
+fn blocked_ports_to_labels(
+    blocked_ports: &[PortPair],
+    port_to_label: &HashMap<u16, String>,
+) -> HashSet<(String, String)> {
+    let mut out = HashSet::new();
+    for (pa, pb) in blocked_ports {
+        if let (Some(la), Some(lb)) = (port_to_label.get(pa), port_to_label.get(pb)) {
+            let (lo, hi) = if la <= lb {
+                (la.clone(), lb.clone())
+            } else {
+                (lb.clone(), la.clone())
+            };
+            out.insert((lo, hi));
+        }
+    }
+    out
+}
+
+/// Pure hysteresis evaluator — given the current positions, port map, and
+/// which pairs are already blocked, return the set of pairs that *should*
+/// be blocked now. Hysteresis: a blocked pair only unblocks when distance <
+/// radius - HYSTERESIS; an unblocked pair only becomes blocked when distance
+/// > radius + HYSTERESIS. Extracted so it's unit-testable independent of
+/// `pfctl`, tokio, or the full `AppState`.
+fn compute_desired_blocked(
+    positions: &[(String, Position)],
+    ports: &HashMap<String, u16>,
+    currently_blocked_labels: &HashSet<(String, String)>,
+    radius_m: f32,
+) -> HashSet<PortPair> {
+    let unblock_radius = (radius_m - HYSTERESIS_M).max(0.0);
+    let block_radius = radius_m + HYSTERESIS_M;
+    let mut desired: HashSet<PortPair> = HashSet::new();
+    for i in 0..positions.len() {
+        for j in (i + 1)..positions.len() {
+            let (la, pa) = &positions[i];
+            let (lb, pb) = &positions[j];
+            let Some(&pa_port) = ports.get(la) else { continue };
+            let Some(&pb_port) = ports.get(lb) else { continue };
+
+            let (lo, hi) = if la <= lb {
+                (la.clone(), lb.clone())
+            } else {
+                (lb.clone(), la.clone())
+            };
+            let was_blocked = currently_blocked_labels.contains(&(lo, hi));
+
+            let should_block = if was_blocked {
+                !geom::in_range(*pa, *pb, unblock_radius)
+            } else {
+                !geom::in_range(*pa, *pb, block_radius)
+            };
+            if should_block {
+                desired.insert(normalize_pair(pa_port, pb_port));
+            }
+        }
+    }
+    desired
+}
+
+async fn partition_reconciler(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(RECONCILER_TICK_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Track the last radius we acted on so we can log the swap when a game
+    // loads (or unloads).
+    let mut last_radius: Option<f32> = None;
+
+    loop {
+        interval.tick().await;
+
+        let positions = snapshot_positions(&state);
+        if positions.len() < 2 {
+            continue;
+        }
+
+        // Phase C: use the active game's `comm_radius_m` if a game is loaded,
+        // otherwise the pre-game default.
+        let radius_m = active_comm_radius(&state);
+        if last_radius.map(|r| (r - radius_m).abs() > f32::EPSILON).unwrap_or(true) {
+            println!("[partition_reconciler] comm radius -> {radius_m:.1}m");
+            last_radius = Some(radius_m);
+        }
+
+        let current_blocked_ports = state.pf.blocked_pairs();
+        let ports = label_port_map(&state);
+        let port_to_label: HashMap<u16, String> =
+            ports.iter().map(|(l, p)| (*p, l.clone())).collect();
+
+        let currently_blocked_labels =
+            blocked_ports_to_labels(&current_blocked_ports, &port_to_label);
+
+        let desired_blocked =
+            compute_desired_blocked(&positions, &ports, &currently_blocked_labels, radius_m);
+
+        match state.pf.set_blocked(desired_blocked).await {
+            Ok(Some((added, removed))) => {
+                if !added.is_empty() || !removed.is_empty() {
+                    println!(
+                        "[partition_reconciler] diff +{} -{} (total blocked={})",
+                        added.len(),
+                        removed.len(),
+                        state.pf.blocked_pairs().len()
+                    );
+                    let partitions = partition_list(&state);
+                    // Emit the generic `partition_changed` for the network
+                    // graph to refetch, and an auto-tagged `partition_auto`
+                    // so the consensus-stalled banner can tell that this
+                    // change was reconciler-driven (vs a human click).
+                    let _ = state.sse_tx.send(
+                        serde_json::json!({"type": "partition_changed", "partitions": partitions})
+                            .to_string(),
+                    );
+                    let _ = state.sse_tx.send(
+                        serde_json::json!({
+                            "type": "partition_auto",
+                            "partitions": partitions,
+                            "radius_m": radius_m,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            Ok(None) => { /* no change */ }
+            Err(e) => {
+                eprintln!("[partition_reconciler] set_blocked failed: {e:#}");
+            }
         }
     }
 }
@@ -495,9 +848,31 @@ async fn get_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeInfoRespo
         config.nodes.iter().map(|n| {
             let status = if nodes.contains_key(&n.label) { "running" } else { "stopped" };
             let role = agent_states.get(&n.label).map(|s| s.local.role.clone());
-            NodeInfoResponse { label: n.label.clone(), bind: n.bind.clone(), role, status: status.to_string() }
+            NodeInfoResponse {
+                label: n.label.clone(),
+                bind: n.bind.clone(),
+                role,
+                status: status.to_string(),
+                initial_x: n.initial_x,
+                initial_y: n.initial_y,
+            }
         }).collect(),
     )
+}
+
+async fn get_game_snapshots(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let snaps = state.game_snapshots.lock().unwrap();
+    let map: serde_json::Map<String, serde_json::Value> =
+        snaps.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    Json(serde_json::Value::Object(map))
+}
+
+async fn get_games(State(state): State<Arc<AppState>>) -> Json<Vec<GameConfig>> {
+    let mut list: Vec<GameConfig> = state.games.configs.values().cloned().collect();
+    list.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(list)
 }
 
 // --- Node lifecycle ---
@@ -506,9 +881,9 @@ fn spawn_node(state: &Arc<AppState>, label: &str) -> bool {
     let (node_config, peers_info) = {
         let config = state.config.lock().unwrap();
         let nc = config.nodes.iter().find(|n| n.label == label).cloned();
-        let peers: Vec<(String, String)> = config.nodes.iter()
+        let peers: Vec<(String, String, String)> = config.nodes.iter()
             .filter(|n| n.label != label)
-            .map(|n| (n.bind.clone(), n.pubkey.clone()))
+            .map(|n| (n.bind.clone(), n.pubkey.clone(), n.label.clone()))
             .collect();
         (nc, peers)
     };
@@ -530,6 +905,9 @@ fn spawn_node(state: &Arc<AppState>, label: &str) -> bool {
     let event_log = state.project_root.join(format!("artifacts/{label}-events.jsonl"));
     let cmd_file = state.project_root.join(format!("artifacts/{label}-cmd.json"));
 
+    let game_file = state.project_root.join(format!("artifacts/{label}-game.json"));
+    let swarm_size = { state.config.lock().unwrap().nodes.len() };
+
     let exe = std::env::current_exe().unwrap();
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("run")
@@ -540,11 +918,22 @@ fn spawn_node(state: &Arc<AppState>, label: &str) -> bool {
         .arg("--state-file").arg(&state_file)
         .arg("--proof-dir").arg(&proof_dir)
         .arg("--event-log").arg(&event_log)
-        .arg("--cmd-file").arg(&cmd_file);
+        .arg("--cmd-file").arg(&cmd_file)
+        .arg("--game-file").arg(&game_file)
+        .arg("--games-dir").arg(&state.games.dir)
+        .arg("--swarm-size").arg(format!("{swarm_size}"));
 
-    for (addr, pubkey) in &peers_info {
+    if let Some(x) = node_config.initial_x {
+        cmd.arg("--initial-x").arg(format!("{x}"));
+    }
+    if let Some(y) = node_config.initial_y {
+        cmd.arg("--initial-y").arg(format!("{y}"));
+    }
+
+    for (addr, pubkey, peer_label) in &peers_info {
         cmd.arg("--peer-addr").arg(addr)
-            .arg("--peer-pubkey").arg(pubkey);
+            .arg("--peer-pubkey").arg(pubkey)
+            .arg("--peer-label").arg(peer_label);
     }
 
     // Restarting a fixed-member node with the same key/port works reliably here
@@ -636,6 +1025,163 @@ async fn set_role(
     Json(serde_json::json!({"status": "ok", "role": body.role}))
 }
 
+#[derive(Deserialize)]
+struct PositionRequest {
+    x: f32,
+    y: f32,
+}
+
+/// Write a game command file for the child to pick up in its next control
+/// tick. If the child isn't running we still update the cached snapshot and
+/// node-config so the UI stays in sync (e.g. dragging a stopped node).
+fn write_game_cmd(
+    state: &AppState,
+    label: &str,
+    cmd: serde_json::Value,
+) -> Result<(), String> {
+    let nodes = state.nodes.lock().unwrap();
+    if !nodes.contains_key(label) {
+        return Err("node not running".to_string());
+    }
+    let cmd_file = state.project_root.join(format!("artifacts/{label}-cmd.json"));
+    std::fs::write(
+        &cmd_file,
+        serde_json::to_string(&cmd).unwrap_or_default(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+async fn set_position(
+    State(state): State<Arc<AppState>>,
+    AxumPath(label): AxumPath<String>,
+    Json(body): Json<PositionRequest>,
+) -> Json<serde_json::Value> {
+    // Clamp to field.
+    let x = body.x.clamp(0.0, FIELD_WIDTH_M);
+    let y = body.y.clamp(0.0, FIELD_HEIGHT_M);
+
+    // Persist the new position on the node-config so it survives restarts.
+    {
+        let mut config = state.config.lock().unwrap();
+        if let Some(node) = config.nodes.iter_mut().find(|n| n.label == label) {
+            node.initial_x = Some(x);
+            node.initial_y = Some(y);
+        }
+        let _ = std::fs::write(
+            &state.config_path,
+            serde_json::to_string_pretty(&*config).unwrap_or_default(),
+        );
+    }
+
+    // Update the live snapshot so the frontend gets immediate feedback even
+    // before the consensus event comes back through file_watcher.
+    {
+        let mut snaps = state.game_snapshots.lock().unwrap();
+        let snap = snaps.entry(label.clone()).or_insert_with(|| serde_json::json!({}));
+        snap["my_position"] = serde_json::json!({"x": x, "y": y});
+        if let Some(entities) = snap.get_mut("entities").and_then(|e| e.as_object_mut()) {
+            if let Some(entry) = entities.get_mut(&label) {
+                entry["pos"] = serde_json::json!({"x": x, "y": y});
+            } else {
+                entities.insert(
+                    label.clone(),
+                    serde_json::json!({
+                        "label": label,
+                        "peer_id": "",
+                        "pos": {"x": x, "y": y},
+                        "properties": {},
+                        "claimed_at_ms": 0,
+                        "last_seen_ms": 0
+                    }),
+                );
+            }
+        }
+        let _ = state.sse_tx.send(
+            serde_json::json!({
+                "type": "game_state_changed",
+                "label": label,
+                "snapshot": snap,
+            })
+            .to_string(),
+        );
+    }
+
+    // Ask the child (if running) to broadcast a SensorReading with the new
+    // position so every node sees it in consensus order.
+    let cmd = serde_json::json!({
+        "command": "set_position",
+        "x": x,
+        "y": y,
+    });
+    let broadcast_status = match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => "queued",
+        Err(_) => "offline",
+    };
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "x": x,
+        "y": y,
+        "broadcast": broadcast_status
+    }))
+}
+
+async fn propose_game(
+    State(state): State<Arc<AppState>>,
+    AxumPath((label, game_id)): AxumPath<(String, String)>,
+) -> Json<serde_json::Value> {
+    let cmd = serde_json::json!({ "command": "propose_game", "game_id": game_id });
+    match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => Json(serde_json::json!({"status": "queued", "game_id": game_id})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn vote_game(
+    State(state): State<Arc<AppState>>,
+    AxumPath((label, game_id)): AxumPath<(String, String)>,
+) -> Json<serde_json::Value> {
+    let cmd = serde_json::json!({ "command": "vote_game", "game_id": game_id });
+    match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => Json(serde_json::json!({"status": "queued", "game_id": game_id})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+#[derive(Deserialize)]
+struct EntityTypeRequest {
+    entity_type: String,
+    #[serde(default)]
+    team: Option<String>,
+}
+
+async fn claim_entity(
+    State(state): State<Arc<AppState>>,
+    AxumPath(label): AxumPath<String>,
+    Json(body): Json<EntityTypeRequest>,
+) -> Json<serde_json::Value> {
+    let cmd = serde_json::json!({
+        "command": "claim_entity",
+        "entity_type": body.entity_type,
+        "team": body.team,
+    });
+    match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => Json(serde_json::json!({"status": "queued"})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+async fn ready_up(
+    State(state): State<Arc<AppState>>,
+    AxumPath(label): AxumPath<String>,
+) -> Json<serde_json::Value> {
+    let cmd = serde_json::json!({ "command": "ready_up" });
+    match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => Json(serde_json::json!({"status": "queued"})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
 // --- Swarm management ---
 
 #[derive(Deserialize)]
@@ -656,14 +1202,36 @@ async fn create_swarm(
 
     let count = body.count.max(1).min(26);
     let mut labels = Vec::new();
+    let mut new_positions: Vec<Position> = Vec::new();
 
     {
         let mut config = state.config.lock().unwrap();
+        // Seed with any already-placed positions to avoid overlaps across
+        // create_swarm invocations. Re-creating a swarm after a destroy starts
+        // with an empty existing vec.
+        let mut existing: Vec<Position> = config
+            .nodes
+            .iter()
+            .filter_map(|n| match (n.initial_x, n.initial_y) {
+                (Some(x), Some(y)) => Some(Position { x, y }),
+                _ => None,
+            })
+            .collect();
+        let mut rng = rand::thread_rng();
+
         for i in 0..count {
             let letter = (b'a' + i as u8) as char;
             let label = format!("agent-{letter}");
             let port = 9000 + i as u16;
             let key = KeySecret::generate();
+            let pos = geom::place_randomly_without_overlap(
+                &existing,
+                (FIELD_WIDTH_M, FIELD_HEIGHT_M),
+                MIN_SEP_M,
+                &mut rng,
+            );
+            existing.push(pos);
+            new_positions.push(pos);
 
             config.nodes.push(NodeConfig {
                 label: label.clone(),
@@ -671,6 +1239,8 @@ async fn create_swarm(
                 secret: key.to_string(),
                 pubkey: key.public().to_string(),
                 role: "carrier".into(),
+                initial_x: Some(pos.x),
+                initial_y: Some(pos.y),
             });
             labels.push(label);
         }
@@ -678,6 +1248,49 @@ async fn create_swarm(
             &state.config_path,
             serde_json::to_string_pretty(&*config).unwrap_or_default(),
         );
+    }
+
+    // Seed game_snapshots so the frontend can render the field immediately —
+    // even before the child processes start and broadcast their seed
+    // SensorReadings over consensus.
+    {
+        let config = state.config.lock().unwrap();
+        let mut snaps = state.game_snapshots.lock().unwrap();
+        for (label, pos) in labels.iter().zip(new_positions.iter()) {
+            let peer_id = config
+                .nodes
+                .iter()
+                .find(|n| &n.label == label)
+                .map(|n| n.pubkey.clone())
+                .unwrap_or_default();
+            let snapshot = serde_json::json!({
+                "label": label,
+                "peer_id": peer_id,
+                "phase": "no_game",
+                "active_game_id": null,
+                "my_position": { "x": pos.x, "y": pos.y },
+                "entities": {
+                    label.clone(): {
+                        "label": label,
+                        "peer_id": peer_id,
+                        "entity_type": null,
+                        "team": null,
+                        "pos": { "x": pos.x, "y": pos.y },
+                        "properties": {},
+                        "claimed_at_ms": 0,
+                        "last_seen_ms": 0
+                    }
+                },
+                "scores": {},
+                "proposal_window": null,
+                "vote_window": null,
+                "proximity_tracker": {},
+                "countdown_zero_ns": null,
+                "placement_ok": false,
+                "ready_peers": []
+            });
+            snaps.insert(label.clone(), snapshot);
+        }
     }
 
     println!("Swarm created with {} nodes: {}", count, labels.join(", "));
@@ -718,6 +1331,8 @@ async fn destroy_swarm(
     state.proofs.lock().unwrap().clear();
     state.log_offsets.lock().unwrap().clear();
     state.proof_counts.lock().unwrap().clear();
+    state.game_snapshots.lock().unwrap().clear();
+    state.game_file_mtimes.lock().unwrap().clear();
     println!("Swarm destroyed");
 
     let _ = state.sse_tx.send(
@@ -837,9 +1452,278 @@ async fn clear_artifacts(
     state.proofs.lock().unwrap().clear();
     state.log_offsets.lock().unwrap().clear();
     state.proof_counts.lock().unwrap().clear();
+    state.game_snapshots.lock().unwrap().clear();
+    state.game_file_mtimes.lock().unwrap().clear();
     let _ = state.sse_tx.send(
         serde_json::json!({"type": "artifacts_cleared", "ts": now_ms()}).to_string(),
     );
 
     Json(serde_json::json!({"status": "ok"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cfg(id: &str, radius: f32) -> GameConfig {
+        GameConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            comm_radius_m: radius,
+            teams: vec![],
+            entity_types: vec![],
+            placement: vec![],
+            rules: vec![],
+        }
+    }
+
+    #[test]
+    fn majority_picks_unanimous_game_id() {
+        let snaps = vec![
+            json!({"active_game_id": "ctf"}),
+            json!({"active_game_id": "ctf"}),
+            json!({"active_game_id": "ctf"}),
+        ];
+        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
+    }
+
+    #[test]
+    fn majority_ignores_empty_and_missing() {
+        let snaps = vec![
+            json!({}),
+            json!({"active_game_id": ""}),
+            json!({"active_game_id": "ctf"}),
+        ];
+        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
+    }
+
+    #[test]
+    fn majority_none_when_no_game_loaded() {
+        let snaps = vec![json!({}), json!({"active_game_id": null})];
+        assert_eq!(majority_active_game_id(snaps.iter()), None);
+    }
+
+    #[test]
+    fn majority_wins_by_count_then_lex() {
+        // 2 "ctf" vs 1 "koth" → ctf wins on count.
+        let snaps = vec![
+            json!({"active_game_id": "ctf"}),
+            json!({"active_game_id": "ctf"}),
+            json!({"active_game_id": "koth"}),
+        ];
+        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
+
+        // 1 each → lexicographic tiebreak picks "ctf" (smaller).
+        let snaps = vec![
+            json!({"active_game_id": "koth"}),
+            json!({"active_game_id": "ctf"}),
+        ];
+        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
+    }
+
+    #[test]
+    fn resolve_radius_uses_loaded_game() {
+        let mut configs = HashMap::new();
+        configs.insert("ctf".into(), cfg("ctf", 8.0));
+        configs.insert("koth".into(), cfg("koth", 15.0));
+
+        assert_eq!(resolve_comm_radius(Some("ctf"), &configs), 8.0);
+        assert_eq!(resolve_comm_radius(Some("koth"), &configs), 15.0);
+    }
+
+    #[test]
+    fn resolve_radius_falls_back_to_pre_game() {
+        let configs: HashMap<String, GameConfig> = HashMap::new();
+        assert_eq!(resolve_comm_radius(None, &configs), PRE_GAME_COMM_RADIUS_M);
+
+        // Unknown id also falls back (defensive against stale snapshots).
+        let mut configs = HashMap::new();
+        configs.insert("ctf".into(), cfg("ctf", 8.0));
+        assert_eq!(
+            resolve_comm_radius(Some("unknown"), &configs),
+            PRE_GAME_COMM_RADIUS_M
+        );
+    }
+
+    // --- Scripted hysteresis scenarios for the partition reconciler ---
+    //
+    // Proxies for the "cargo run -- stress" harness: the full 7-node
+    // integration test requires a library target (the package is bin-only),
+    // so we exercise the reconciler's hysteresis boundary directly. These
+    // tests catch the specific failure modes the stress harness was designed
+    // to find: premature blocking inside the hysteresis window, unbounded
+    // flapping at the boundary, and incorrect recovery after a partition.
+
+    fn pos(x: f32, y: f32) -> Position {
+        Position { x, y }
+    }
+
+    fn two_node_setup() -> (Vec<(String, Position)>, HashMap<String, u16>) {
+        let positions = vec![("a".to_string(), pos(0.0, 0.0)), ("b".to_string(), pos(0.0, 0.0))];
+        let mut ports = HashMap::new();
+        ports.insert("a".to_string(), 40001);
+        ports.insert("b".to_string(), 40002);
+        (positions, ports)
+    }
+
+    #[test]
+    fn reconciler_blocks_outside_block_radius() {
+        let (mut positions, ports) = two_node_setup();
+        // 9m apart with radius=8, hysteresis=0.5 → block_radius=8.5. 9 > 8.5 → block.
+        positions[1].1 = pos(9.0, 0.0);
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        assert_eq!(desired.len(), 1, "expected one blocked pair");
+    }
+
+    #[test]
+    fn reconciler_does_not_block_inside_hysteresis_window() {
+        let (mut positions, ports) = two_node_setup();
+        // 8.2m apart, radius=8, hysteresis=0.5 → block_radius=8.5. 8.2 <= 8.5 → no block.
+        positions[1].1 = pos(8.2, 0.0);
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        assert!(desired.is_empty(), "expected no blocks in hysteresis window");
+    }
+
+    #[test]
+    fn reconciler_keeps_blocked_inside_hysteresis_window() {
+        let (mut positions, ports) = two_node_setup();
+        // Pair is already blocked. At 7.8m (radius=8, unblock=7.5), we stay blocked.
+        positions[1].1 = pos(7.8, 0.0);
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+        blocked.insert(("a".into(), "b".into()));
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        assert_eq!(desired.len(), 1, "expected still-blocked pair to stay blocked");
+    }
+
+    #[test]
+    fn reconciler_unblocks_once_inside_unblock_radius() {
+        let (mut positions, ports) = two_node_setup();
+        // Pair is currently blocked. At 7.4m, inside unblock_radius=7.5 → unblock.
+        positions[1].1 = pos(7.4, 0.0);
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+        blocked.insert(("a".into(), "b".into()));
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        assert!(desired.is_empty(), "expected pair to unblock");
+    }
+
+    #[test]
+    fn reconciler_flapping_at_boundary_stays_stable() {
+        // A node walking back and forth across exactly radius_m=8.0 shouldn't
+        // cause churn, because the block/unblock bands don't overlap at the
+        // exact radius. This is the demo-critical property.
+        let (mut positions, ports) = two_node_setup();
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+
+        let distances = [7.9_f32, 8.0, 8.1, 8.0, 7.9, 8.1, 7.95, 8.05];
+        let mut transition_count = 0;
+
+        for d in distances {
+            positions[1].1 = pos(d, 0.0);
+            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+            let now_blocked: HashSet<(String, String)> = desired
+                .iter()
+                .map(|(a, b)| {
+                    let la = if *a == 40001 { "a" } else { "b" };
+                    let lb = if *b == 40002 { "b" } else { "a" };
+                    let (lo, hi) = if la <= lb { (la, lb) } else { (lb, la) };
+                    (lo.to_string(), hi.to_string())
+                })
+                .collect();
+            if now_blocked != blocked {
+                transition_count += 1;
+            }
+            blocked = now_blocked;
+        }
+
+        // With 0.5m hysteresis, a ±0.1m flap around radius=8 should never
+        // transition — the movement stays inside the hysteresis dead band.
+        assert_eq!(transition_count, 0, "hysteresis failed to absorb flapping");
+    }
+
+    #[test]
+    fn reconciler_recovers_after_full_separation_then_return() {
+        // Models the demo's "drag far away → heal" story. 5 ticks at 20m
+        // apart: fully blocked. Then 5 ticks at 3m apart: unblocked.
+        let (mut positions, ports) = two_node_setup();
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+
+        for _ in 0..5 {
+            positions[1].1 = pos(20.0, 0.0);
+            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+            blocked = desired
+                .iter()
+                .map(|_| ("a".to_string(), "b".to_string()))
+                .collect();
+            assert_eq!(blocked.len(), 1, "should be blocked when far apart");
+        }
+
+        for _ in 0..5 {
+            positions[1].1 = pos(3.0, 0.0);
+            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+            blocked = desired
+                .iter()
+                .map(|_| ("a".to_string(), "b".to_string()))
+                .collect();
+        }
+        assert!(blocked.is_empty(), "should recover after returning to close range");
+    }
+
+    #[test]
+    fn reconciler_radius_swap_re_partitions_mid_distance() {
+        // Two nodes 10m apart. Pre-game radius 12.0 → no block. CTF radius 8.0
+        // → blocked. This is the Phase C "game loaded, radius tightens" story.
+        let (mut positions, ports) = two_node_setup();
+        positions[1].1 = pos(10.0, 0.0);
+
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired_pre = compute_desired_blocked(&positions, &ports, &blocked, 12.0);
+        assert!(desired_pre.is_empty(), "pre-game radius 12m should keep 10m pair connected");
+
+        let desired_ctf = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        assert_eq!(desired_ctf.len(), 1, "CTF radius 8m should block 10m pair");
+    }
+
+    #[test]
+    fn parse_violation_reporter_form() {
+        let (rule, reason) = parse_violation(
+            "[cardinality] claim-123 from agent-b rejected: flag already at max cardinality (1)",
+        );
+        assert_eq!(rule, "cardinality");
+        assert_eq!(reason, "flag already at max cardinality (1)");
+    }
+
+    #[test]
+    fn parse_violation_observer_form() {
+        let (rule, reason) = parse_violation("[cardinality] from agent-b: flag already at max");
+        assert_eq!(rule, "cardinality");
+        assert_eq!(reason, "flag already at max");
+    }
+
+    #[test]
+    fn parse_violation_unknown_form_preserves_message() {
+        let (rule, reason) = parse_violation("something went sideways");
+        assert!(rule.is_empty());
+        assert_eq!(reason, "something went sideways");
+    }
+
+    #[test]
+    fn reconciler_three_way_split_isolates_outlier() {
+        // 3 nodes: a and b colocated, c 20m away. Only pairs involving c
+        // should be blocked.
+        let positions = vec![
+            ("a".to_string(), pos(0.0, 0.0)),
+            ("b".to_string(), pos(1.0, 0.0)),
+            ("c".to_string(), pos(20.0, 0.0)),
+        ];
+        let mut ports = HashMap::new();
+        ports.insert("a".into(), 40001);
+        ports.insert("b".into(), 40002);
+        ports.insert("c".into(), 40003);
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        assert_eq!(desired.len(), 2, "expected 2 blocked pairs (a-c, b-c)");
+    }
 }

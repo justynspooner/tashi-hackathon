@@ -1,8 +1,15 @@
+mod defaults;
+mod game_fsm;
+mod game_state;
+mod games;
+mod geom;
 mod node;
 mod pf;
 mod proof;
 mod protocol;
+mod rules;
 mod state;
+mod stress;
 mod web;
 
 use std::path::PathBuf;
@@ -41,6 +48,10 @@ enum Command {
         /// Peer public keys (repeat for multiple peers, same order as --peer-addr).
         #[arg(long)]
         peer_pubkey: Vec<String>,
+        /// Peer labels (repeat for multiple peers, same order as --peer-addr).
+        /// Optional: if present, must match the length of `--peer-addr`.
+        #[arg(long)]
+        peer_label: Vec<String>,
         #[arg(long, default_value = "agent")]
         label: String,
         #[arg(long, default_value = "carrier")]
@@ -63,6 +74,23 @@ enum Command {
         event_log: Option<PathBuf>,
         #[arg(long)]
         cmd_file: Option<PathBuf>,
+        /// Optional initial X position (metres on the playing field).
+        #[arg(long)]
+        initial_x: Option<f32>,
+        /// Optional initial Y position (metres on the playing field).
+        #[arg(long)]
+        initial_y: Option<f32>,
+        /// Path for the per-node game-state snapshot (defaults to
+        /// `artifacts/{label}-game.json`).
+        #[arg(long)]
+        game_file: Option<PathBuf>,
+        /// Path to a directory of pre-installed game configs (JSON files).
+        #[arg(long, default_value = "games")]
+        games_dir: PathBuf,
+        /// Number of nodes in the swarm — used to compute the majority
+        /// threshold for proposals/votes.
+        #[arg(long, default_value_t = 1)]
+        swarm_size: usize,
         /// Signal that this node is joining an already-running session (reconnect).
         #[arg(long)]
         joining: bool,
@@ -73,6 +101,10 @@ enum Command {
         #[arg(long, default_value_t = 3001)]
         port: u16,
     },
+    /// Run the scripted reconciler stress scenarios (no Vertex, no sudo).
+    /// Exits non-zero on failure — wire into CI to catch hysteresis
+    /// regressions before they reach the demo.
+    Stress,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -99,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
             secret,
             peer_addr,
             peer_pubkey,
+            peer_label,
             label,
             role,
             status,
@@ -110,15 +143,26 @@ async fn main() -> anyhow::Result<()> {
             proof_dir,
             event_log,
             cmd_file,
+            initial_x,
+            initial_y,
+            game_file,
+            games_dir,
+            swarm_size,
             joining,
         } => {
             anyhow::ensure!(
                 peer_addr.len() == peer_pubkey.len(),
                 "Must have equal number of --peer-addr and --peer-pubkey arguments"
             );
-            let peers: Vec<(String, String)> = peer_addr
+            anyhow::ensure!(
+                peer_label.is_empty() || peer_label.len() == peer_addr.len(),
+                "If --peer-label is provided, it must have the same count as --peer-addr"
+            );
+            let peers: Vec<(String, String, Option<String>)> = peer_addr
                 .into_iter()
                 .zip(peer_pubkey.into_iter())
+                .enumerate()
+                .map(|(i, (a, k))| (a, k, peer_label.get(i).cloned()))
                 .collect();
 
             let state_file = state_file
@@ -129,6 +173,15 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| PathBuf::from(format!("artifacts/{label}-events.jsonl")));
             let cmd_file = cmd_file
                 .unwrap_or_else(|| PathBuf::from(format!("artifacts/{label}-cmd.json")));
+            let game_file = game_file
+                .unwrap_or_else(|| PathBuf::from(format!("artifacts/{label}-game.json")));
+
+            let initial_position = match (initial_x, initial_y) {
+                (Some(x), Some(y)) => Some(protocol::Position { x, y }),
+                _ => None,
+            };
+
+            let games_map = games::load_all(&games_dir).unwrap_or_default();
 
             node::run(
                 bind,
@@ -145,6 +198,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(proof_dir),
                 Some(event_log),
                 Some(cmd_file),
+                Some(game_file),
+                initial_position,
+                games_map,
+                swarm_size,
                 None,
                 None,
                 joining,
@@ -153,6 +210,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve { port } => {
             web::serve(port).await?;
+        }
+        Command::Stress => {
+            stress::run()?;
         }
     }
 

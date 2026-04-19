@@ -6,9 +6,9 @@ use anyhow::Context;
 use tokio::process::Command;
 
 /// Sorted pair of ports representing a blocked connection.
-type PortPair = (u16, u16);
+pub type PortPair = (u16, u16);
 
-fn normalize_pair(a: u16, b: u16) -> PortPair {
+pub fn normalize_pair(a: u16, b: u16) -> PortPair {
     if a <= b { (a, b) } else { (b, a) }
 }
 
@@ -146,6 +146,34 @@ impl PfPartitionManager {
         self.reload_rules().await?;
         println!("Healed ports {} <-> {}", port_a, port_b);
         Ok(())
+    }
+
+    /// Atomically replace the blocked-pair set and reload the ruleset in a
+    /// single `pfctl -f` call. Returns `Ok(None)` if no change was needed, or
+    /// `Ok(Some((added, removed)))` describing the diff that was applied.
+    pub async fn set_blocked(
+        &self,
+        desired: HashSet<PortPair>,
+    ) -> anyhow::Result<Option<(Vec<PortPair>, Vec<PortPair>)>> {
+        // Diff under the lock — if no change, skip ensure_setup / reload.
+        let (added, removed) = {
+            let mut blocked = self.blocked.lock().unwrap();
+            if *blocked == desired {
+                return Ok(None);
+            }
+            let current: HashSet<_> = blocked.clone();
+            let added: Vec<_> = desired.difference(&current).copied().collect();
+            let removed: Vec<_> = current.difference(&desired).copied().collect();
+            *blocked = desired;
+            (added, removed)
+        };
+
+        // Only do the (expensive) pfctl ensure_setup / reload if we have some
+        // blocks. Transitioning from "blocks exist" → "no blocks" still needs
+        // a reload so the rules drop away.
+        self.ensure_setup().await?;
+        self.reload_rules().await?;
+        Ok(Some((added, removed)))
     }
 
     /// Get all currently blocked pairs as port tuples.

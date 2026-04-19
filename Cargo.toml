@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Tashi Vertex Warmup - Stateful Handshake implementation"
 
+[lib]
+name = "warmup_vertex_rust"
+path = "src/lib.rs"
+
 [[bin]]
 name = "node"
 path = "src/main.rs"
@@ -20,3 +24,4 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+rand = "0.8"

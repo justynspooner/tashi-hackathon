@@ -10,8 +10,9 @@ use anyhow::Context as _;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
+use crate::game_state::LocalGameState;
 use crate::proof::ProofOfCoordination;
-use crate::protocol::{MessageKind, SharedState, WireMessage};
+use crate::protocol::{MessageKind, Position, SharedState, WireMessage};
 
 // --- Cross-thread channel types ---
 
@@ -40,12 +41,29 @@ pub enum WebEvent {
         label: String,
         status: String,
     },
+    GameStateChanged {
+        label: String,
+        snapshot: serde_json::Value,
+    },
+    RuleViolated {
+        label: String,
+        rule_id: String,
+        reason: String,
+    },
+    PartitionAuto {
+        partitions: Vec<[String; 2]>,
+    },
 }
 
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum NodeCommand {
     SetRole(String),
+    ProposeGame(String),
+    VoteGame(String),
+    ClaimEntity { entity_type: String, team: Option<String> },
+    SetPosition { x: f32, y: f32 },
+    ReadyUp,
 }
 
 pub type SharedRuntime = Arc<Mutex<RuntimeState>>;
@@ -74,6 +92,15 @@ pub struct RuntimeState {
     pub sync_points_seen: u64,
     pub auto_toggle_done: bool,
     pub cmd_file: Option<PathBuf>,
+    // Game-related additions (Phase A+)
+    pub game_file: Option<PathBuf>,
+    pub initial_position: Option<Position>,
+    pub seed_broadcast_done: bool,
+    pub game_state: LocalGameState,
+    /// Authoritative `peer_id -> label` mapping, passed in from the web
+    /// server at spawn via `--peer-label`. Includes every peer (not self);
+    /// used by the rules engine / log formatting to key by human labels.
+    pub peer_labels: HashMap<String, String>,
 }
 
 impl RuntimeState {
@@ -85,7 +112,12 @@ impl RuntimeState {
         status: String,
         state_file: Option<PathBuf>,
         cmd_file: Option<PathBuf>,
+        game_file: Option<PathBuf>,
+        initial_position: Option<Position>,
+        peer_labels: HashMap<String, String>,
     ) -> Self {
+        let game_state =
+            LocalGameState::new(label.clone(), local_public_key.clone(), initial_position);
         Self {
             label,
             local: SharedState {
@@ -103,7 +135,24 @@ impl RuntimeState {
             sync_points_seen: 0,
             auto_toggle_done: false,
             cmd_file,
+            game_file,
+            initial_position,
+            seed_broadcast_done: false,
+            game_state,
+            peer_labels,
         }
+    }
+
+    /// Resolve a `peer_id` to its human-readable label. Falls back to the
+    /// short-form suffix for unknown peers (e.g. stale keys during restart).
+    pub fn label_for_peer(&self, peer_id: &str) -> String {
+        if peer_id == self.local_public_key {
+            return self.label.clone();
+        }
+        if let Some(lbl) = self.peer_labels.get(peer_id) {
+            return lbl.clone();
+        }
+        short_peer_id(peer_id)
     }
 
     pub fn next_message_id(&mut self, kind: &MessageKind, sent_at_ms: u64) -> String {
@@ -255,4 +304,17 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock must be after Unix epoch")
         .as_millis() as u64
+}
+
+pub fn persist_game_state(state: &RuntimeState) -> anyhow::Result<()> {
+    let Some(path) = state.game_file.as_ref() else {
+        return Ok(());
+    };
+    crate::game_state::persist(&state.game_state, path)?;
+    let snapshot = serde_json::to_value(&state.game_state).unwrap_or(serde_json::Value::Null);
+    send_web_event(WebEvent::GameStateChanged {
+        label: state.label.clone(),
+        snapshot,
+    });
+    Ok(())
 }

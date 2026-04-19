@@ -11,12 +11,53 @@ use tashi_vertex::{
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
+use crate::game_fsm::{self, FsmEffect};
+use crate::game_state::{EntityRecord, GamePhase};
+use crate::games::GameConfig;
 use crate::proof::ProofOfCoordination;
-use crate::protocol::{MessageKind, WireMessage};
+use crate::protocol::{GamePayload, MessageKind, Position, SensorDatum, WireMessage};
+use crate::rules::{self, RuleContext, RuleDecision};
 use crate::state::{
     log, now_ms, persist_state, send_web_event, set_event_log_path, set_web_sender,
     short_peer_id, update_peer_state, NodeCommand, PeerInfo, RuntimeState, SharedRuntime, WebEvent,
 };
+
+/// Helper for the two places we log a rule violation — keeps the log entry,
+/// SSE fan-out, and (optional) consensus broadcast in one spot.
+fn report_violation(
+    state: &RuntimeState,
+    outcome: &mut VertexOutcome,
+    rule_id: String,
+    reason: String,
+    offender_msg_id: String,
+    peer_id: &str,
+    peer_short: &str,
+) {
+    log(
+        "RULE_VIOLATION",
+        &state.label,
+        format!("[{rule_id}] {offender_msg_id} from {peer_short} rejected: {reason}"),
+    );
+    send_web_event(WebEvent::RuleViolated {
+        label: state.label.clone(),
+        rule_id: rule_id.clone(),
+        reason: reason.clone(),
+    });
+    // Only the originator broadcasts the RuleViolation through consensus so
+    // every node observes the same ordered event. Non-originators already
+    // logged the verdict from their own evaluation above.
+    if peer_id == state.local_public_key {
+        outcome.follow_up_txs.push((
+            MessageKind::RuleViolation,
+            Some(format!("violated {rule_id}")),
+            Some(GamePayload::RuleViolation {
+                rule_id,
+                offender_msg_id,
+                reason,
+            }),
+        ));
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct FileCommand {
@@ -25,18 +66,29 @@ struct FileCommand {
     role: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    game_id: Option<String>,
+    #[serde(default)]
+    entity_type: Option<String>,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    x: Option<f32>,
+    #[serde(default)]
+    y: Option<f32>,
 }
 
 /// Internal request from the control task to the engine task.
 struct TxRequest {
     kind: MessageKind,
     note: Option<String>,
+    payload: Option<GamePayload>,
 }
 
 pub async fn run(
     bind: String,
     secret: String,
-    peers_info: Vec<(String, String)>, // Vec of (addr, pubkey)
+    peers_info: Vec<(String, String, Option<String>)>, // Vec of (addr, pubkey, Option<label>)
     label: String,
     role: String,
     status: String,
@@ -48,6 +100,10 @@ pub async fn run(
     proof_dir: Option<PathBuf>,
     event_log: Option<PathBuf>,
     cmd_file: Option<PathBuf>,
+    game_file: Option<PathBuf>,
+    initial_position: Option<Position>,
+    games: HashMap<String, GameConfig>,
+    swarm_size: usize,
     web_tx: Option<mpsc::UnboundedSender<WebEvent>>,
     cmd_rx: Option<mpsc::UnboundedReceiver<NodeCommand>>,
     joining: bool,
@@ -58,8 +114,9 @@ pub async fn run(
 
     let mut vertex_peers = Peers::new()?;
     let mut peer_map: HashMap<String, PeerInfo> = HashMap::new();
+    let mut peer_labels: HashMap<String, String> = HashMap::new();
 
-    for (peer_addr, peer_pubkey) in &peers_info {
+    for (peer_addr, peer_pubkey, peer_label) in &peers_info {
         let peer_pub: KeyPublic = peer_pubkey.parse()?;
         vertex_peers.insert(peer_addr, &peer_pub, Default::default())?;
         peer_map.insert(
@@ -70,6 +127,9 @@ pub async fn run(
                 handshake_logged: false,
             },
         );
+        if let Some(lbl) = peer_label {
+            peer_labels.insert(peer_pubkey.clone(), lbl.clone());
+        }
     }
     vertex_peers.insert(&bind, &key.public(), Default::default())?;
 
@@ -111,20 +171,25 @@ pub async fn run(
         status,
         state_file,
         cmd_file,
+        game_file,
+        initial_position,
+        peer_labels,
     )));
 
     {
         let state = runtime.lock().unwrap();
-        let peer_addrs: Vec<&str> = peers_info.iter().map(|(a, _)| a.as_str()).collect();
+        let peer_addrs: Vec<&str> = peers_info.iter().map(|(a, _, _)| a.as_str()).collect();
         persist_state(&state)?;
+        crate::state::persist_game_state(&state)?;
         log(
             "BOOT",
             &label,
             format!(
-                "vertex_bind={} peers=[{}] id=...{}",
+                "vertex_bind={} peers=[{}] id=...{} initial_pos={:?}",
                 bind,
                 peer_addrs.join(", "),
-                &local_public_key[local_public_key.len().saturating_sub(8)..]
+                &local_public_key[local_public_key.len().saturating_sub(8)..],
+                state.initial_position,
             ),
         );
     }
@@ -132,14 +197,26 @@ pub async fn run(
     // Channel for the control task to request transactions without touching the engine directly.
     let (tx_req_sender, tx_req_receiver) = mpsc::unbounded_channel::<TxRequest>();
 
+    let games = Arc::new(games);
+
     tokio::select! {
-        r = engine_loop(engine, runtime.clone(), proof_dir, tx_req_receiver) => r?,
+        r = engine_loop(
+            engine,
+            runtime.clone(),
+            proof_dir,
+            tx_req_receiver,
+            tx_req_sender.clone(),
+            games.clone(),
+            swarm_size,
+        ) => r?,
         r = control_loop(
             runtime.clone(),
             toggle_role_to,
             toggle_after_ms,
             cmd_rx,
             tx_req_sender,
+            games.clone(),
+            swarm_size,
         ) => r?,
         _ = tokio::signal::ctrl_c() => {
             log("SHUTDOWN", &runtime.lock().unwrap().label, "received signal");
@@ -156,6 +233,9 @@ async fn engine_loop(
     runtime: SharedRuntime,
     proof_dir: Option<PathBuf>,
     mut tx_req_rx: mpsc::UnboundedReceiver<TxRequest>,
+    tx_req_sender: mpsc::UnboundedSender<TxRequest>,
+    games: Arc<HashMap<String, GameConfig>>,
+    swarm_size: usize,
 ) -> anyhow::Result<()> {
     let mut proof_seq: u64 = 0;
 
@@ -206,22 +286,46 @@ async fn engine_loop(
                                 &runtime,
                                 MessageKind::Hello,
                                 Some("signed hello via Vertex".to_string()),
+                                None,
                             )?;
-                            let state = runtime.lock().unwrap();
-                            log(
-                                "HANDSHAKE",
-                                &state.label,
-                                format!(
-                                    "sent HELLO {} role={} status={}",
-                                    hello.message_id, state.local.role, state.local.status
-                                ),
-                            );
+                            {
+                                let state = runtime.lock().unwrap();
+                                log(
+                                    "HANDSHAKE",
+                                    &state.label,
+                                    format!(
+                                        "sent HELLO {} role={} status={}",
+                                        hello.message_id, state.local.role, state.local.status
+                                    ),
+                                );
+                            }
+
+                            // Broadcast seed SensorReading carrying our initial
+                            // position so every peer observes our starting
+                            // location in consensus order.
+                            let seed_pos = { runtime.lock().unwrap().initial_position };
+                            if let Some(pos) = seed_pos {
+                                let payload = GamePayload::SensorReading {
+                                    pos,
+                                    readings: Vec::new(),
+                                    observed_at_ms: now_ms(),
+                                };
+                                let _ = send_vertex_transaction(
+                                    &engine,
+                                    &runtime,
+                                    MessageKind::SensorReading,
+                                    Some(format!("seed position ({:.2}, {:.2})", pos.x, pos.y)),
+                                    Some(payload),
+                                );
+                                let mut state = runtime.lock().unwrap();
+                                state.seed_broadcast_done = true;
+                            }
                         }
                     }
                     Message::Event(event) => {
                         let creator = event.creator().to_string();
                         let tx_count = event.transaction_count();
-                        let is_local = {
+                        {
                             let state = runtime.lock().unwrap();
                             let creator_short = short_peer_id(&creator);
                             let is_self = creator == state.local_public_key;
@@ -236,11 +340,14 @@ async fn engine_loop(
                                     is_self
                                 ),
                             );
-                            is_self
-                        };
-                        if is_local {
-                            continue;
                         }
+                        // Intentionally do NOT skip self-authored events: the
+                        // local node needs to observe its own ReadyUp,
+                        // GameProposal, etc. in consensus order so it joins
+                        // the same FSM state every other node reaches. Each
+                        // handler inside `handle_vertex_message` guards
+                        // against duplicate broadcasts using
+                        // `peer_id == state.local_public_key`.
 
                         // Log finality for consensus events that carry transactions
                         if event.transaction_count() > 0 {
@@ -263,10 +370,20 @@ async fn engine_loop(
                         }
 
                         if let Some(ref dir) = proof_dir {
-                            // Only create proofs for events containing role changes (state_update)
+                            // Create proofs for role changes and for game-significant
+                            // consensus events (deltas, violations, end). Hellos and
+                            // heartbeats are excluded to keep the proof set focused.
                             let has_state_update = event.transactions().any(|tx| {
                                 serde_json::from_slice::<WireMessage>(tx)
-                                    .map(|w| matches!(w.kind, MessageKind::StateUpdate))
+                                    .map(|w| {
+                                        matches!(
+                                            w.kind,
+                                            MessageKind::StateUpdate
+                                                | MessageKind::GameStateDelta
+                                                | MessageKind::RuleViolation
+                                                | MessageKind::GameEnd
+                                        )
+                                    })
                                     .unwrap_or(false)
                             });
                             if has_state_update {
@@ -295,6 +412,7 @@ async fn engine_loop(
                             }
                         }
 
+                        let consensus_at_ns = event.consensus_at() as u128;
                         for tx in event.transactions() {
                             let wire: WireMessage = match serde_json::from_slice(tx) {
                                 Ok(w) => w,
@@ -303,13 +421,24 @@ async fn engine_loop(
                             if wire.state.peer_id != creator {
                                 continue;
                             }
-                            if let Some(reply_note) = handle_vertex_message(&runtime, wire)? {
+                            let outcome = handle_vertex_message(
+                                &runtime,
+                                wire.clone(),
+                                consensus_at_ns,
+                                &games,
+                                swarm_size,
+                            )?;
+                            if let Some(reply_note) = outcome.reply_note {
                                 let _ = send_vertex_transaction(
                                     &engine,
                                     &runtime,
                                     MessageKind::StateUpdate,
                                     Some(reply_note),
+                                    None,
                                 );
+                            }
+                            for (kind, note, payload) in outcome.follow_up_txs {
+                                let _ = tx_req_sender.send(TxRequest { kind, note, payload });
                             }
                         }
                     }
@@ -326,7 +455,7 @@ fn process_tx_request(engine: &Engine, runtime: &SharedRuntime, req: TxRequest) 
         let state = runtime.lock().unwrap();
         log("ACTION", &state.label, format!("sending {action} via Vertex..."));
     }
-    match send_vertex_transaction(engine, runtime, req.kind, req.note) {
+    match send_vertex_transaction(engine, runtime, req.kind, req.note, req.payload) {
         Ok(msg) => {
             let state = runtime.lock().unwrap();
             let tag = if is_heartbeat { "HEARTBEAT" } else { "ACTION" };
@@ -347,17 +476,59 @@ fn process_tx_request(engine: &Engine, runtime: &SharedRuntime, req: TxRequest) 
     }
 }
 
-fn handle_vertex_message(runtime: &SharedRuntime, wire: WireMessage) -> anyhow::Result<Option<String>> {
+#[derive(Default)]
+struct VertexOutcome {
+    reply_note: Option<String>,
+    follow_up_txs: Vec<(MessageKind, Option<String>, Option<GamePayload>)>,
+}
+
+fn handle_vertex_message(
+    runtime: &SharedRuntime,
+    wire: WireMessage,
+    consensus_at_ns: u128,
+    games: &HashMap<String, GameConfig>,
+    swarm_size: usize,
+) -> anyhow::Result<VertexOutcome> {
     let mut state = runtime.lock().unwrap();
     let peer_id = wire.state.peer_id.clone();
     let peer_short = short_peer_id(&peer_id);
-    let mut reply_note = None;
+    let mut outcome = VertexOutcome::default();
+    let mut game_changed = false;
+    let now = now_ms();
 
     update_peer_state(&mut state, &wire);
 
+    // Consensus-clock countdown check. Every event carries a consensus
+    // timestamp identical across all nodes; once that exceeds
+    // `countdown_zero_ns + 3s` we flip to Playing. Because the same event
+    // reaches the threshold on every node, this transition is exactly
+    // synchronised — no wall-clock skew, no broadcast messages.
+    if state.game_state.phase == GamePhase::CountingDown {
+        if let Some(zero) = state.game_state.countdown_zero_ns {
+            if consensus_at_ns >= zero.saturating_add(3_000_000_000) {
+                state.game_state.phase = GamePhase::Playing;
+                // Clean up any wall-clock bookkeeping keys that might
+                // have slipped in from an older build.
+                state.game_state.scores.remove("__countdown_start_ms");
+                log(
+                    "GAME_EVENT",
+                    &state.label,
+                    format!(
+                        "countdown complete → Playing (consensus_at={consensus_at_ns}, zero={zero})"
+                    ),
+                );
+                game_changed = true;
+            }
+        }
+    }
+
     match wire.kind {
         MessageKind::Hello => {
-            reply_note = Some(format!("current state for {peer_short}"));
+            // Only reply to *other* peers' Hellos — don't echo our own back
+            // through consensus.
+            if peer_id != state.local_public_key {
+                outcome.reply_note = Some(format!("current state for {peer_short}"));
+            }
             if let Some(peer_info) = state.peers.get_mut(&peer_id) {
                 if !peer_info.handshake_logged {
                     peer_info.handshake_logged = true;
@@ -385,10 +556,502 @@ fn handle_vertex_message(runtime: &SharedRuntime, wire: WireMessage) -> anyhow::
         MessageKind::Heartbeat => {
             // Heartbeat received — update_peer_state already tracked last_contact_ms
         }
+        MessageKind::SensorReading => {
+            if let Some(GamePayload::SensorReading {
+                pos,
+                observed_at_ms,
+                ..
+            }) = &wire.game
+            {
+                // Bad-actor check first — evaluate physical plausibility against
+                // the *pre-update* entity position. If rejected, log and skip the
+                // position update so all nodes reach the same conclusion.
+                let pre_check_ctx_ok = state
+                    .game_state
+                    .active_game_id
+                    .as_ref()
+                    .and_then(|id| games.get(id))
+                    .map(|game_cfg| {
+                        let ctx = RuleContext {
+                            game: game_cfg,
+                            local: &state.game_state,
+                            now_ms: now,
+                        };
+                        rules::evaluate(&ctx, &wire)
+                    })
+                    .unwrap_or_else(|| vec![RuleDecision::Accept]);
+
+                let mut rejected_physics = false;
+                for dec in &pre_check_ctx_ok {
+                    if let RuleDecision::Reject { rule_id, reason } = dec {
+                        if rule_id == "physically_plausible" {
+                            rejected_physics = true;
+                            report_violation(
+                                &state,
+                                &mut outcome,
+                                rule_id.clone(),
+                                reason.clone(),
+                                wire.message_id.clone(),
+                                &peer_id,
+                                &peer_short,
+                            );
+                        }
+                    }
+                }
+
+                if !rejected_physics {
+                    let peer_label = peer_id_to_label(&state, &peer_id);
+                    let entity = state
+                        .game_state
+                        .entities
+                        .entry(peer_label.clone())
+                        .or_insert_with(|| EntityRecord {
+                            label: peer_label.clone(),
+                            peer_id: peer_id.clone(),
+                            ..Default::default()
+                        });
+                    entity.peer_id = peer_id.clone();
+                    entity.pos = Some(*pos);
+                    entity.last_seen_ms = *observed_at_ms;
+                    if peer_id == state.local_public_key {
+                        state.game_state.my_position = Some(*pos);
+                    }
+                    state.game_state.record_sensor(wire.clone());
+                    game_changed = true;
+                    log(
+                        "SENSOR",
+                        &state.label,
+                        format!(
+                            "peer {peer_short} pos=({:.2},{:.2}) t={observed_at_ms} ({})",
+                            pos.x, pos.y, wire.message_id
+                        ),
+                    );
+
+                    // Re-evaluate rules after the position update: refresh the
+                    // proximity tracker, then run `on: sensor_reading` rules.
+                    // Only the *originating* node broadcasts resulting deltas to
+                    // avoid N redundant broadcasts per rule fire.
+                    if let Some(game_id) = state.game_state.active_game_id.clone() {
+                        if let Some(game_cfg) = games.get(&game_id) {
+                            rules::update_proximity(&mut state.game_state, game_cfg, now);
+                            let ctx = RuleContext {
+                                game: game_cfg,
+                                local: &state.game_state,
+                                now_ms: now,
+                            };
+                            let decisions = rules::evaluate(&ctx, &wire);
+                            let is_originator = peer_id == state.local_public_key;
+                            for dec in decisions {
+                                match dec {
+                                    RuleDecision::Emit { rule_id, patches } if is_originator => {
+                                        log(
+                                            "RULE",
+                                            &state.label,
+                                            format!("fire {rule_id} -> delta({} patches)", patches.len()),
+                                        );
+                                        outcome.follow_up_txs.push((
+                                            MessageKind::GameStateDelta,
+                                            Some(format!("rule {rule_id}")),
+                                            Some(GamePayload::GameStateDelta { patches }),
+                                        ));
+                                    }
+                                    RuleDecision::End { winner_team, reason } if is_originator => {
+                                        outcome.follow_up_txs.push((
+                                            MessageKind::GameEnd,
+                                            Some("rule end".into()),
+                                            Some(GamePayload::GameEnd {
+                                                winner_team,
+                                                reason,
+                                            }),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        MessageKind::GameProposal => {
+            if let Some(GamePayload::GameProposal { game_id }) = &wire.game {
+                log(
+                    "GAME_EVENT",
+                    &state.label,
+                    format!("proposal from {peer_short}: {game_id} ({})", wire.message_id),
+                );
+                let effects =
+                    game_fsm::apply_proposal(&mut state.game_state, peer_id.clone(), game_id.clone(), now, swarm_size);
+                for eff in effects {
+                    match eff {
+                        FsmEffect::AutoVote { game_id } => {
+                            outcome.follow_up_txs.push((
+                                MessageKind::GameVote,
+                                Some(format!("auto-vote {game_id}")),
+                                Some(GamePayload::GameVote { game_id }),
+                            ));
+                        }
+                        FsmEffect::LoadGame { game_id } => {
+                            state.game_state.active_game_id = Some(game_id.clone());
+                            state.game_state.phase = GamePhase::PlacingEntities;
+                            log("GAME_EVENT", &state.label, format!("loaded game: {game_id}"));
+                        }
+                    }
+                }
+                game_changed = true;
+            }
+        }
+        MessageKind::GameVote => {
+            if let Some(GamePayload::GameVote { game_id }) = &wire.game {
+                log(
+                    "GAME_EVENT",
+                    &state.label,
+                    format!("vote from {peer_short}: {game_id} ({})", wire.message_id),
+                );
+                let effects =
+                    game_fsm::apply_vote(&mut state.game_state, peer_id.clone(), game_id.clone(), now, swarm_size);
+                for eff in effects {
+                    if let FsmEffect::LoadGame { game_id } = eff {
+                        state.game_state.active_game_id = Some(game_id.clone());
+                        state.game_state.phase = GamePhase::PlacingEntities;
+                        log("GAME_EVENT", &state.label, format!("loaded game: {game_id}"));
+                    }
+                }
+                game_changed = true;
+            }
+        }
+        MessageKind::EntityTypeClaim => {
+            if let (Some(GamePayload::EntityTypeClaim { entity_type, team }), Some(game_id)) =
+                (&wire.game, state.game_state.active_game_id.clone())
+            {
+                if let Some(game_cfg) = games.get(&game_id) {
+                    let ctx = RuleContext {
+                        game: game_cfg,
+                        local: &state.game_state,
+                        now_ms: now,
+                    };
+                    let decisions = rules::evaluate(&ctx, &wire);
+                    let mut rejected = false;
+                    for dec in decisions {
+                        if let RuleDecision::Reject { rule_id, reason } = dec {
+                            rejected = true;
+                            report_violation(
+                                &state,
+                                &mut outcome,
+                                rule_id,
+                                reason,
+                                wire.message_id.clone(),
+                                &peer_id,
+                                &peer_short,
+                            );
+                        }
+                    }
+                    if !rejected {
+                        // Accept the claim — record it on the entity.
+                        let peer_label = peer_id_to_label(&state, &peer_id);
+                        let entity = state
+                            .game_state
+                            .entities
+                            .entry(peer_label.clone())
+                            .or_insert_with(|| EntityRecord {
+                                label: peer_label.clone(),
+                                peer_id: peer_id.clone(),
+                                ..Default::default()
+                            });
+                        entity.entity_type = Some(entity_type.clone());
+                        entity.team = team.clone();
+                        entity.claimed_at_ms = now;
+                        game_changed = true;
+                        log(
+                            "GAME_EVENT",
+                            &state.label,
+                            format!(
+                                "claim accepted {peer_short} -> {entity_type}{} ({})",
+                                team.as_ref().map(|t| format!("/{t}")).unwrap_or_default(),
+                                wire.message_id
+                            ),
+                        );
+
+                        // Rescan the bounded sensor_history: predicates that
+                        // reference this entity type may have been silently
+                        // failing earlier (unknown entity) and should now
+                        // produce a consistent decision. Only the originating
+                        // node broadcasts any resulting deltas, mirroring the
+                        // sensor_reading handler.
+                        if let Some(game_cfg) = games.get(&game_id) {
+                            rules::update_proximity(&mut state.game_state, game_cfg, now);
+                            let history: Vec<WireMessage> = state
+                                .game_state
+                                .sensor_history
+                                .iter()
+                                .cloned()
+                                .collect();
+                            for past in history {
+                                let sender = past.state.peer_id.clone();
+                                let ctx = RuleContext {
+                                    game: game_cfg,
+                                    local: &state.game_state,
+                                    now_ms: now,
+                                };
+                                let decisions = rules::evaluate(&ctx, &past);
+                                let is_originator = sender == state.local_public_key;
+                                for dec in decisions {
+                                    match dec {
+                                        RuleDecision::Emit { rule_id, patches }
+                                            if is_originator =>
+                                        {
+                                            log(
+                                                "RULE",
+                                                &state.label,
+                                                format!(
+                                                    "rescan fire {rule_id} -> delta({} patches)",
+                                                    patches.len()
+                                                ),
+                                            );
+                                            outcome.follow_up_txs.push((
+                                                MessageKind::GameStateDelta,
+                                                Some(format!("rule {rule_id} (rescan)")),
+                                                Some(GamePayload::GameStateDelta { patches }),
+                                            ));
+                                        }
+                                        RuleDecision::End { winner_team, reason }
+                                            if is_originator =>
+                                        {
+                                            outcome.follow_up_txs.push((
+                                                MessageKind::GameEnd,
+                                                Some("rule end (rescan)".into()),
+                                                Some(GamePayload::GameEnd {
+                                                    winner_team,
+                                                    reason,
+                                                }),
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    log(
+                        "GAME_EVENT",
+                        &state.label,
+                        format!("claim without loaded game (game_id={game_id}); ignoring"),
+                    );
+                }
+            }
+        }
+        MessageKind::ReadyUp => {
+            if !state.game_state.ready_peers.iter().any(|p| p == &peer_id) {
+                state.game_state.ready_peers.push(peer_id.clone());
+            }
+            let ready_count = state.game_state.ready_peers.len();
+            log(
+                "GAME_EVENT",
+                &state.label,
+                format!(
+                    "ready-up from {peer_short} ({}/{} ready)",
+                    ready_count, swarm_size
+                ),
+            );
+            if ready_count >= swarm_size && state.game_state.countdown_zero_ns.is_none() {
+                // Pin `countdown_zero_ns` to the consensus timestamp of the
+                // event that pushed the count over — this is identical on
+                // every node, so the 3s countdown fires in lockstep.
+                state.game_state.countdown_zero_ns = Some(consensus_at_ns);
+                state.game_state.phase = GamePhase::CountingDown;
+            }
+            game_changed = true;
+        }
+        MessageKind::GameStateDelta => {
+            if let Some(GamePayload::GameStateDelta { patches }) = &wire.game {
+                log(
+                    "GAME_EVENT",
+                    &state.label,
+                    format!(
+                        "delta from {peer_short} ({} patches, {})",
+                        patches.len(),
+                        wire.message_id
+                    ),
+                );
+
+                // Apply each patch, tracking the ones that actually change
+                // local state — subsequent idempotent re-applies are no-ops
+                // and must not fire chained rules like property_changed.
+                let mut real_changes: Vec<crate::protocol::StatePatch> = Vec::new();
+                for patch in patches {
+                    let mut matched = false;
+                    for entity in state.game_state.entities.values_mut() {
+                        if entity.peer_id != patch.target_peer_id {
+                            continue;
+                        }
+                        matched = true;
+                        let current = entity.properties.get(&patch.key).cloned();
+                        if current.as_ref() != Some(&patch.value) {
+                            entity
+                                .properties
+                                .insert(patch.key.clone(), patch.value.clone());
+                            real_changes.push(patch.clone());
+                        }
+                        break;
+                    }
+                    if !matched {
+                        // Unknown target — could be a late-arriving delta for an
+                        // entity we haven't seen yet. Log and ignore; a later
+                        // re-scan would be needed for strict convergence.
+                        log(
+                            "GAME_EVENT",
+                            &state.label,
+                            format!(
+                                "delta patch targets unknown peer {} (key={})",
+                                &patch.target_peer_id[..6.min(patch.target_peer_id.len())],
+                                patch.key
+                            ),
+                        );
+                    }
+                }
+                game_changed = true;
+
+                // Fire `on: game_state_delta` rules against the real changes.
+                // Only the sender of the originating delta broadcasts any
+                // follow-up deltas to keep volume down; but IncrementScore is
+                // applied locally on every node so scores converge.
+                if !real_changes.is_empty() {
+                    if let Some(game_id) = state.game_state.active_game_id.clone() {
+                        if let Some(game_cfg) = games.get(&game_id) {
+                            rules::update_proximity(&mut state.game_state, game_cfg, now);
+                            let ctx = RuleContext {
+                                game: game_cfg,
+                                local: &state.game_state,
+                                now_ms: now,
+                            };
+                            let decisions = rules::evaluate_delta(&ctx, &peer_id, &real_changes);
+                            let is_originator = peer_id == state.local_public_key;
+                            for dec in decisions {
+                                match dec {
+                                    RuleDecision::Emit { rule_id, patches } if is_originator => {
+                                        log(
+                                            "RULE",
+                                            &state.label,
+                                            format!(
+                                                "fire {rule_id} -> delta({} patches)",
+                                                patches.len()
+                                            ),
+                                        );
+                                        outcome.follow_up_txs.push((
+                                            MessageKind::GameStateDelta,
+                                            Some(format!("rule {rule_id}")),
+                                            Some(GamePayload::GameStateDelta { patches }),
+                                        ));
+                                    }
+                                    RuleDecision::IncrementScore { rule_id, team, by } => {
+                                        let new_score = {
+                                            let entry = state
+                                                .game_state
+                                                .scores
+                                                .entry(team.clone())
+                                                .or_insert(0);
+                                            *entry += by;
+                                            *entry
+                                        };
+                                        log(
+                                            "RULE",
+                                            &state.label,
+                                            format!(
+                                                "fire {rule_id} -> score[{team}] += {by} (now {new_score})"
+                                            ),
+                                        );
+                                    }
+                                    RuleDecision::End { winner_team, reason }
+                                        if is_originator =>
+                                    {
+                                        outcome.follow_up_txs.push((
+                                            MessageKind::GameEnd,
+                                            Some("rule end".into()),
+                                            Some(GamePayload::GameEnd {
+                                                winner_team,
+                                                reason,
+                                            }),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        MessageKind::RuleViolation => {
+            if let Some(GamePayload::RuleViolation { rule_id, reason, .. }) = &wire.game {
+                log(
+                    "RULE_VIOLATION",
+                    &state.label,
+                    format!("[{rule_id}] from {peer_short}: {reason}"),
+                );
+                // Surface the consensus-observed violation over SSE so the
+                // frontend gets a dedicated signal per node (vs the
+                // reporter-only emit in report_violation).
+                send_web_event(WebEvent::RuleViolated {
+                    label: state.label.clone(),
+                    rule_id: rule_id.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        MessageKind::GameEnd => {
+            state.game_state.phase = GamePhase::Ended;
+            log("GAME_EVENT", &state.label, format!("game_end from {peer_short}"));
+            game_changed = true;
+        }
     }
 
     persist_state(&state)?;
-    Ok(reply_note)
+    if game_changed {
+        // Recompute placement_ok for the local node before persisting —
+        // frontend reads this to gate the Ready-Up button. When placement_ok
+        // flips, also drive the PlacingEntities ↔ Ready transition so
+        // downstream consumers (NodeControl, overlays) can distinguish
+        // "positions still need adjusting" from "good to go, waiting on
+        // peers".
+        if let Some(game_id) = &state.game_state.active_game_id {
+            if let Some(game_cfg) = games.get(game_id) {
+                let new_ok = rules::evaluate_placement(
+                    game_cfg,
+                    &state.label,
+                    &state.game_state.entities,
+                );
+                if new_ok != state.game_state.placement_ok {
+                    log(
+                        "GAME_EVENT",
+                        &state.label,
+                        format!("placement_ok -> {new_ok}"),
+                    );
+                    state.game_state.placement_ok = new_ok;
+                    match (state.game_state.phase, new_ok) {
+                        (GamePhase::PlacingEntities, true) => {
+                            state.game_state.phase = GamePhase::Ready;
+                        }
+                        (GamePhase::Ready, false) => {
+                            state.game_state.phase = GamePhase::PlacingEntities;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        crate::state::persist_game_state(&state)?;
+    }
+    Ok(outcome)
+}
+
+/// Resolve a `peer_id` to its human label. Delegates to the authoritative
+/// `RuntimeState::label_for_peer` which consults the `peer_labels` map
+/// populated from `--peer-label` flags at spawn time. Falls back to the
+/// short-form suffix for peers we don't know about (e.g. if labels weren't
+/// provided in a CLI-only run).
+fn peer_id_to_label(state: &RuntimeState, peer_id: &str) -> String {
+    state.label_for_peer(peer_id)
 }
 
 // --- Control loop: sends TxRequests through a channel instead of touching Engine ---
@@ -399,18 +1062,24 @@ async fn control_loop(
     toggle_after_ms: u64,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<NodeCommand>>,
     tx_sender: mpsc::UnboundedSender<TxRequest>,
+    games: Arc<HashMap<String, GameConfig>>,
+    swarm_size: usize,
 ) -> anyhow::Result<()> {
     let started_at_ms = now_ms();
     let mut interval = time::interval(Duration::from_millis(200));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_heartbeat_ms = 0u64;
+    let mut last_fsm_tick_ms = 0u64;
+    let mut last_rules_tick_ms = 0u64;
 
     loop {
         interval.tick().await;
         let now = now_ms();
         let mut should_send_state_update = false;
         let mut should_send_heartbeat = false;
-        let mut target_role = None;
+        let mut target_role: Option<String> = None;
+        // Queue of game-payload transactions to broadcast after releasing the lock.
+        let mut game_txs: Vec<(MessageKind, Option<String>, Option<GamePayload>)> = Vec::new();
 
         // Application-level heartbeat every 2 seconds
         if now.saturating_sub(last_heartbeat_ms) >= 2_000 {
@@ -439,6 +1108,76 @@ async fn control_loop(
                             state.local.role = new_role.clone();
                             target_role = Some(new_role);
                             should_send_state_update = true;
+                        }
+                        Ok(NodeCommand::ProposeGame(game_id)) => {
+                            game_txs.push((
+                                MessageKind::GameProposal,
+                                Some(format!("propose {game_id}")),
+                                Some(GamePayload::GameProposal { game_id }),
+                            ));
+                        }
+                        Ok(NodeCommand::VoteGame(game_id)) => {
+                            game_txs.push((
+                                MessageKind::GameVote,
+                                Some(format!("vote {game_id}")),
+                                Some(GamePayload::GameVote { game_id }),
+                            ));
+                        }
+                        Ok(NodeCommand::ClaimEntity { entity_type, team }) => {
+                            let note = match &team {
+                                Some(t) => format!("claim {entity_type}/{t}"),
+                                None => format!("claim {entity_type}"),
+                            };
+                            game_txs.push((
+                                MessageKind::EntityTypeClaim,
+                                Some(note),
+                                Some(GamePayload::EntityTypeClaim { entity_type, team }),
+                            ));
+                        }
+                        Ok(NodeCommand::SetPosition { x, y }) => {
+                            let pos = Position { x, y };
+                            state.game_state.my_position = Some(pos);
+                            let my_label = state.label.clone();
+                            if let Some(entity) = state.game_state.entities.get_mut(&my_label) {
+                                entity.pos = Some(pos);
+                                entity.last_seen_ms = now;
+                            }
+                            // We'll persist the game state after the lock block.
+                            let readings: Vec<SensorDatum> = state
+                                .game_state
+                                .entities
+                                .iter()
+                                .filter(|(lbl, _)| lbl != &&state.label)
+                                .filter_map(|(_, e)| {
+                                    let peer_pos = e.pos?;
+                                    let dx = peer_pos.x - pos.x;
+                                    let dy = peer_pos.y - pos.y;
+                                    let distance_m = (dx * dx + dy * dy).sqrt();
+                                    let angle_rad = dy.atan2(dx);
+                                    Some(SensorDatum {
+                                        peer_id: e.peer_id.clone(),
+                                        distance_m,
+                                        angle_rad,
+                                    })
+                                })
+                                .collect();
+                            let payload = GamePayload::SensorReading {
+                                pos,
+                                readings,
+                                observed_at_ms: now,
+                            };
+                            game_txs.push((
+                                MessageKind::SensorReading,
+                                Some(format!("position -> ({:.2},{:.2})", x, y)),
+                                Some(payload),
+                            ));
+                        }
+                        Ok(NodeCommand::ReadyUp) => {
+                            game_txs.push((
+                                MessageKind::ReadyUp,
+                                Some("ready".to_string()),
+                                Some(GamePayload::ReadyUp),
+                            ));
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -469,6 +1208,84 @@ async fn control_loop(
                                         persist_state(&state)?;
                                     }
                                 }
+                                "propose_game" => {
+                                    if let Some(game_id) = cmd.game_id {
+                                        game_txs.push((
+                                            MessageKind::GameProposal,
+                                            Some(format!("propose {game_id}")),
+                                            Some(GamePayload::GameProposal { game_id }),
+                                        ));
+                                    }
+                                }
+                                "vote_game" => {
+                                    if let Some(game_id) = cmd.game_id {
+                                        game_txs.push((
+                                            MessageKind::GameVote,
+                                            Some(format!("vote {game_id}")),
+                                            Some(GamePayload::GameVote { game_id }),
+                                        ));
+                                    }
+                                }
+                                "claim_entity" => {
+                                    if let Some(entity_type) = cmd.entity_type {
+                                        let team = cmd.team;
+                                        let note = match &team {
+                                            Some(t) => format!("claim {entity_type}/{t}"),
+                                            None => format!("claim {entity_type}"),
+                                        };
+                                        game_txs.push((
+                                            MessageKind::EntityTypeClaim,
+                                            Some(note),
+                                            Some(GamePayload::EntityTypeClaim { entity_type, team }),
+                                        ));
+                                    }
+                                }
+                                "set_position" => {
+                                    if let (Some(x), Some(y)) = (cmd.x, cmd.y) {
+                                        let pos = Position { x, y };
+                                        state.game_state.my_position = Some(pos);
+                                        let my_label = state.label.clone();
+                                        if let Some(entity) = state.game_state.entities.get_mut(&my_label) {
+                                            entity.pos = Some(pos);
+                                            entity.last_seen_ms = now;
+                                        }
+                                        let readings: Vec<SensorDatum> = state
+                                            .game_state
+                                            .entities
+                                            .iter()
+                                            .filter(|(lbl, _)| lbl != &&state.label)
+                                            .filter_map(|(_, e)| {
+                                                let peer_pos = e.pos?;
+                                                let dx = peer_pos.x - pos.x;
+                                                let dy = peer_pos.y - pos.y;
+                                                let distance_m = (dx * dx + dy * dy).sqrt();
+                                                let angle_rad = dy.atan2(dx);
+                                                Some(SensorDatum {
+                                                    peer_id: e.peer_id.clone(),
+                                                    distance_m,
+                                                    angle_rad,
+                                                })
+                                            })
+                                            .collect();
+                                        let payload = GamePayload::SensorReading {
+                                            pos,
+                                            readings,
+                                            observed_at_ms: now,
+                                        };
+                                        game_txs.push((
+                                            MessageKind::SensorReading,
+                                            Some(format!("position -> ({:.2},{:.2})", x, y)),
+                                            Some(payload),
+                                        ));
+                                    }
+                                }
+                                "ready_up" => {
+                                    game_txs.push((
+                                        MessageKind::ReadyUp,
+                                        Some("ready".to_string()),
+                                        Some(GamePayload::ReadyUp),
+                                    ));
+                                }
                                 other => {
                                     log("CMD", &state.label, format!("unknown command: {other}"));
                                 }
@@ -477,6 +1294,104 @@ async fn control_loop(
                     }
                 }
             }
+
+            // 1 Hz FSM tick for proposal/vote window timeouts.
+            if now.saturating_sub(last_fsm_tick_ms) >= 1_000 {
+                last_fsm_tick_ms = now;
+                let effects = game_fsm::on_tick(&mut state.game_state, now, swarm_size);
+                for eff in effects {
+                    if let FsmEffect::LoadGame { game_id } = eff {
+                        state.game_state.active_game_id = Some(game_id.clone());
+                        state.game_state.phase = GamePhase::PlacingEntities;
+                        log(
+                            "GAME_EVENT",
+                            &state.label,
+                            format!("loaded game (timeout): {game_id}"),
+                        );
+                        crate::state::persist_game_state(&state)?;
+                    }
+                }
+            }
+
+            // 1 Hz rule tick — fires `on: tick` rules (KotH hold_the_hill,
+            // Territory claim_zone). Refreshes proximity tracker first so
+            // duration predicates see fresh pair states.
+            if state.game_state.phase == GamePhase::Playing
+                && now.saturating_sub(last_rules_tick_ms) >= 1_000
+            {
+                last_rules_tick_ms = now;
+                if let Some(game_id) = state.game_state.active_game_id.clone() {
+                    if let Some(game_cfg) = games.get(&game_id) {
+                        rules::update_proximity(&mut state.game_state, game_cfg, now);
+                        let ctx = RuleContext {
+                            game: game_cfg,
+                            local: &state.game_state,
+                            now_ms: now,
+                        };
+                        let decisions = rules::tick(&ctx);
+                        for dec in decisions {
+                            match dec {
+                                RuleDecision::Emit { rule_id, patches } => {
+                                    log(
+                                        "RULE",
+                                        &state.label,
+                                        format!(
+                                            "tick fire {rule_id} -> delta({} patches)",
+                                            patches.len()
+                                        ),
+                                    );
+                                    game_txs.push((
+                                        MessageKind::GameStateDelta,
+                                        Some(format!("rule {rule_id}")),
+                                        Some(GamePayload::GameStateDelta { patches }),
+                                    ));
+                                }
+                                RuleDecision::IncrementScore { rule_id, team, by } => {
+                                    let new_score = {
+                                        let entry = state
+                                            .game_state
+                                            .scores
+                                            .entry(team.clone())
+                                            .or_insert(0);
+                                        *entry += by;
+                                        *entry
+                                    };
+                                    log(
+                                        "RULE",
+                                        &state.label,
+                                        format!(
+                                            "tick fire {rule_id} -> score[{team}] += {by} (now {new_score})"
+                                        ),
+                                    );
+                                    crate::state::persist_game_state(&state)?;
+                                }
+                                RuleDecision::End { winner_team, reason } => {
+                                    game_txs.push((
+                                        MessageKind::GameEnd,
+                                        Some("rule end".into()),
+                                        Some(GamePayload::GameEnd {
+                                            winner_team,
+                                            reason,
+                                        }),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Countdown → Playing is driven by consensus timestamps in
+            // `handle_vertex_message`, not wall-clock here. Heartbeats (2s
+            // cadence) keep consensus time advancing even when no gameplay
+            // events are broadcast, so the transition fires in lockstep on
+            // every node.
+
+            // Persist game state if any of the game commands touched it.
+            if !game_txs.is_empty() {
+                crate::state::persist_game_state(&state)?;
+            }
         }
 
         if should_send_state_update {
@@ -484,12 +1399,18 @@ async fn control_loop(
             let _ = tx_sender.send(TxRequest {
                 kind: MessageKind::StateUpdate,
                 note: Some(format!("role -> {role}")),
+                payload: None,
             });
         } else if should_send_heartbeat {
             let _ = tx_sender.send(TxRequest {
                 kind: MessageKind::Heartbeat,
                 note: None,
+                payload: None,
             });
+        }
+
+        for (kind, note, payload) in game_txs.drain(..) {
+            let _ = tx_sender.send(TxRequest { kind, note, payload });
         }
     }
 }
@@ -501,9 +1422,10 @@ fn send_vertex_transaction(
     runtime: &SharedRuntime,
     kind: MessageKind,
     note: Option<String>,
+    payload: Option<GamePayload>,
 ) -> anyhow::Result<WireMessage> {
     let label = { runtime.lock().unwrap().label.clone() };
-    let message = build_message(runtime, kind, note)?;
+    let message = build_message(runtime, kind, note, payload)?;
     let data = serde_json::to_vec(&message)?;
     let data_len = data.len();
     let mut tx = Transaction::allocate(data_len);
@@ -541,6 +1463,7 @@ fn build_message(
     runtime: &SharedRuntime,
     kind: MessageKind,
     note: Option<String>,
+    payload: Option<GamePayload>,
 ) -> anyhow::Result<WireMessage> {
     let mut state = runtime.lock().unwrap();
     let sent_at_ms = now_ms();
@@ -552,6 +1475,7 @@ fn build_message(
         sent_at_ms,
         state: state.local.clone(),
         note,
+        game: payload,
     };
 
     state.last_message_kind = Some(message.kind.clone());
