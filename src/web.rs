@@ -25,6 +25,11 @@ use crate::games::{self, GameConfig};
 use crate::geom;
 use crate::pf::{normalize_pair, PfPartitionManager, PortPair};
 use crate::proof::ProofOfCoordination;
+
+/// Target max pairwise distance for a freshly-created swarm. One hysteresis
+/// band below the pre-game comm radius so no pair starts in the flap zone of
+/// the partition reconciler.
+const SWARM_MAX_PAIR_SEP_M: f32 = PRE_GAME_COMM_RADIUS_M - HYSTERESIS_M;
 use crate::protocol::{Position, SharedState};
 use crate::state::now_ms;
 
@@ -415,8 +420,17 @@ async fn file_watcher(state: Arc<AppState>) {
                             if let Ok(data) = std::fs::read_to_string(path) {
                                 if let Ok(proof) = serde_json::from_str::<ProofOfCoordination>(&data) {
                                     let fname = path.file_name().unwrap().to_string_lossy().to_string();
-                                    state.proofs.lock().unwrap().push(ProofResponse {
-                                        file: format!("{label}/{fname}"),
+                                    let key = format!("{label}/{fname}");
+                                    // Dedupe against whatever `load_existing_artifacts` or a
+                                    // previous tick may have already pushed — possible when a
+                                    // swarm is destroyed+recreated with the same labels, or if
+                                    // the reconciler races artifact cleanup.
+                                    let mut proofs = state.proofs.lock().unwrap();
+                                    if proofs.iter().any(|p| p.file == key) {
+                                        continue;
+                                    }
+                                    proofs.push(ProofResponse {
+                                        file: key,
                                         agent: label.clone(),
                                         proof,
                                     });
@@ -760,11 +774,15 @@ fn load_existing_artifacts(state: &AppState, artifacts_dir: &Path) {
                     count += 1;
                     if let Ok(data) = std::fs::read_to_string(file_entry.path()) {
                         if let Ok(proof) = serde_json::from_str::<ProofOfCoordination>(&data) {
-                            state.proofs.lock().unwrap().push(ProofResponse {
-                                file: format!("{agent}/{fname}"),
-                                agent: agent.clone(),
-                                proof,
-                            });
+                            let key = format!("{agent}/{fname}");
+                            let mut proofs = state.proofs.lock().unwrap();
+                            if !proofs.iter().any(|p| p.file == key) {
+                                proofs.push(ProofResponse {
+                                    file: key,
+                                    agent: agent.clone(),
+                                    proof,
+                                });
+                            }
                         }
                     }
                 }
@@ -1224,10 +1242,15 @@ async fn create_swarm(
             let label = format!("agent-{letter}");
             let port = 9000 + i as u16;
             let key = KeySecret::generate();
-            let pos = geom::place_randomly_without_overlap(
+            // Place each node such that it's within comm range of every
+            // already-placed node. This keeps the whole swarm connected on
+            // boot so the partition reconciler doesn't block anyone before
+            // the user has a chance to drag nodes around.
+            let pos = geom::place_connected_without_overlap(
                 &existing,
                 (FIELD_WIDTH_M, FIELD_HEIGHT_M),
                 MIN_SEP_M,
+                SWARM_MAX_PAIR_SEP_M,
                 &mut rng,
             );
             existing.push(pos);
