@@ -1,7 +1,6 @@
 export interface SharedState {
   peer_id: string
   last_seen_ms: number
-  role: string
   status: string
 }
 
@@ -51,7 +50,6 @@ export interface EventLogEntry {
 export interface NodeInfo {
   label: string
   bind: string
-  role: string | null
   status: 'running' | 'stopped'
   initial_x?: number | null
   initial_y?: number | null

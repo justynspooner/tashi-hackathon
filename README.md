@@ -116,7 +116,7 @@ Three games ship pre-installed in `games/*.json`. Each one is a consensus-driven
 - Placement constraints (e.g. flag ≥ 20 m from any base, players within 2 m of their base) gate the `Ready` button per node.
 - Ready-up is unanimous; the countdown starts from the consensus timestamp of the final `ReadyUp`, so every node counts down in lockstep with zero clock skew.
 - Gameplay rules (flag capture, hill control, territory hold) are expressed in a restricted declarative DSL (`all`/`any`/`not` predicates over `entity_is`, `proximity_duration_s`, `property_equals`, etc.) and evaluated per-node from the ordered event stream.
-- Moving a node out of the active game's `comm_radius_m` trips `partition_reconciler`, which applies a real `pfctl` block. If that loses quorum, the Finality Chart flattens until the partition heals.
+- Moving a node out of the global `COMM_RADIUS_M` trips `partition_reconciler`, which applies a real `pfctl` block. If that loses quorum, the Finality Chart flattens until the partition heals.
 - Bad-actor transactions (e.g. a `curl`'d `SensorReading` claiming impossible velocity) are rejected by a `physically_plausible` gate on every node.
 
 ## API endpoints
@@ -185,7 +185,7 @@ src/
   state.rs        — Runtime state, persistence, cross-thread channel types
   proof.rs        — ProofOfCoordination generation and verification
   pf.rs           — pfctl-driven partition manager (atomic set_blocked)
-  defaults.rs     — PRE_GAME_COMM_RADIUS_M, MIN_SEP_M, field dimensions
+  defaults.rs     — COMM_RADIUS_M, MIN_SEP_M, field dimensions
   geom.rs         — Pure distance/range helpers + non-overlap random placement
   games.rs        — GameConfig loader for games/*.json
   game_state.rs   — Per-node LocalGameState + persistence to {label}-game.json
@@ -231,6 +231,6 @@ frontend/
 - The Axum server communicates with node threads via `tokio::sync::mpsc` channels — no file-based IPC on the hot path.
 - Per-node game state is persisted to `artifacts/{label}-game.json` and tailed by the web server's `file_watcher`, then pushed to the frontend via SSE.
 - Proof files are written to disk under `artifacts/proofs/` for durability.
-- Network partitions are driven by two paths that share the same `PfPartitionManager`: explicit user partitions via the dashboard, and the range-based `partition_reconciler` task (500 ms cadence, 0.5 m hysteresis around `comm_radius_m`).
+- Network partitions are driven by two paths that share the same `PfPartitionManager`: explicit user partitions via the dashboard, and the range-based `partition_reconciler` task (500 ms cadence, 0.5 m hysteresis around `COMM_RADIUS_M`).
 - The rules engine is pure-function — no I/O, no locks — and evaluated from the consensus event stream, so every node converges to the same decisions.
 - Countdown uses the Vertex `event.consensus_at()` of the final `ReadyUp` to eliminate wall-clock skew across nodes.

@@ -58,7 +58,6 @@ pub enum WebEvent {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum NodeCommand {
-    SetRole(String),
     ProposeGame(String),
     VoteGame(String),
     ClaimEntity { entity_type: String, team: Option<String> },
@@ -90,7 +89,6 @@ pub struct RuntimeState {
     pub next_message_seq: u64,
     pub state_file: Option<PathBuf>,
     pub sync_points_seen: u64,
-    pub auto_toggle_done: bool,
     pub cmd_file: Option<PathBuf>,
     // Game-related additions (Phase A+)
     pub game_file: Option<PathBuf>,
@@ -108,7 +106,6 @@ impl RuntimeState {
         label: String,
         local_public_key: String,
         peers: HashMap<String, PeerInfo>,
-        role: String,
         status: String,
         state_file: Option<PathBuf>,
         cmd_file: Option<PathBuf>,
@@ -123,7 +120,6 @@ impl RuntimeState {
             local: SharedState {
                 peer_id: local_public_key.clone(),
                 last_seen_ms: now_ms(),
-                role,
                 status,
             },
             peers,
@@ -133,7 +129,6 @@ impl RuntimeState {
             next_message_seq: 1,
             state_file,
             sync_points_seen: 0,
-            auto_toggle_done: false,
             cmd_file,
             game_file,
             initial_position,

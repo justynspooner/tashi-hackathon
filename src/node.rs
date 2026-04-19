@@ -63,8 +63,6 @@ fn report_violation(
 struct FileCommand {
     command: String,
     #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     game_id: Option<String>,
@@ -90,12 +88,9 @@ pub async fn run(
     secret: String,
     peers_info: Vec<(String, String, Option<String>)>, // Vec of (addr, pubkey, Option<label>)
     label: String,
-    role: String,
     status: String,
     heartbeat_ms: u64,
     stale_after_ms: u64,
-    toggle_role_to: Option<String>,
-    toggle_after_ms: u64,
     state_file: Option<PathBuf>,
     proof_dir: Option<PathBuf>,
     event_log: Option<PathBuf>,
@@ -167,7 +162,6 @@ pub async fn run(
         label.clone(),
         local_public_key.clone(),
         peer_map,
-        role,
         status,
         state_file,
         cmd_file,
@@ -211,8 +205,6 @@ pub async fn run(
         ) => r?,
         r = control_loop(
             runtime.clone(),
-            toggle_role_to,
-            toggle_after_ms,
             cmd_rx,
             tx_req_sender,
             games.clone(),
@@ -294,8 +286,8 @@ async fn engine_loop(
                                     "HANDSHAKE",
                                     &state.label,
                                     format!(
-                                        "sent HELLO {} role={} status={}",
-                                        hello.message_id, state.local.role, state.local.status
+                                        "sent HELLO {} status={}",
+                                        hello.message_id, state.local.status
                                     ),
                                 );
                             }
@@ -548,8 +540,8 @@ fn handle_vertex_message(
                 "STATE",
                 &state.label,
                 format!(
-                    "peer {peer_short} role={} status={} ({})",
-                    wire.state.role, wire.state.status, wire.message_id
+                    "peer {peer_short} status={} ({})",
+                    wire.state.status, wire.message_id
                 ),
             );
         }
@@ -1058,14 +1050,11 @@ fn peer_id_to_label(state: &RuntimeState, peer_id: &str) -> String {
 
 async fn control_loop(
     runtime: SharedRuntime,
-    toggle_role_to: Option<String>,
-    toggle_after_ms: u64,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<NodeCommand>>,
     tx_sender: mpsc::UnboundedSender<TxRequest>,
     games: Arc<HashMap<String, GameConfig>>,
     swarm_size: usize,
 ) -> anyhow::Result<()> {
-    let started_at_ms = now_ms();
     let mut interval = time::interval(Duration::from_millis(200));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_heartbeat_ms = 0u64;
@@ -1075,9 +1064,7 @@ async fn control_loop(
     loop {
         interval.tick().await;
         let now = now_ms();
-        let mut should_send_state_update = false;
         let mut should_send_heartbeat = false;
-        let mut target_role: Option<String> = None;
         // Queue of game-payload transactions to broadcast after releasing the lock.
         let mut game_txs: Vec<(MessageKind, Option<String>, Option<GamePayload>)> = Vec::new();
 
@@ -1090,25 +1077,10 @@ async fn control_loop(
         {
             let mut state = runtime.lock().unwrap();
 
-            // Role toggle (CLI-driven one-shot)
-            if let Some(ref new_role) = toggle_role_to {
-                if !state.auto_toggle_done && now.saturating_sub(started_at_ms) >= toggle_after_ms {
-                    state.auto_toggle_done = true;
-                    state.local.role = new_role.clone();
-                    target_role = Some(new_role.clone());
-                    should_send_state_update = true;
-                }
-            }
-
             // Command channel (web-driven)
             if let Some(ref mut rx) = cmd_rx {
                 loop {
                     match rx.try_recv() {
-                        Ok(NodeCommand::SetRole(new_role)) => {
-                            state.local.role = new_role.clone();
-                            target_role = Some(new_role);
-                            should_send_state_update = true;
-                        }
                         Ok(NodeCommand::ProposeGame(game_id)) => {
                             game_txs.push((
                                 MessageKind::GameProposal,
@@ -1195,13 +1167,6 @@ async fn control_loop(
                         let _ = fs::remove_file(cmd_path);
                         if let Ok(cmd) = serde_json::from_str::<FileCommand>(&data) {
                             match cmd.command.as_str() {
-                                "set_role" => {
-                                    if let Some(new_role) = cmd.role {
-                                        state.local.role = new_role.clone();
-                                        target_role = Some(new_role);
-                                        should_send_state_update = true;
-                                    }
-                                }
                                 "set_status" => {
                                     if let Some(new_status) = cmd.status {
                                         state.local.status = new_status;
@@ -1394,14 +1359,7 @@ async fn control_loop(
             }
         }
 
-        if should_send_state_update {
-            let role = target_role.unwrap();
-            let _ = tx_sender.send(TxRequest {
-                kind: MessageKind::StateUpdate,
-                note: Some(format!("role -> {role}")),
-                payload: None,
-            });
-        } else if should_send_heartbeat {
+        if should_send_heartbeat {
             let _ = tx_sender.send(TxRequest {
                 kind: MessageKind::Heartbeat,
                 note: None,

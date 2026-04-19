@@ -78,7 +78,6 @@ export interface Rule {
 export interface GameConfig {
   id: string
   name: string
-  comm_radius_m: number
   teams: string[]
   entity_types: EntityTypeDef[]
   placement: PlacementRule[]

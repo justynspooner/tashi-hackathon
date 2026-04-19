@@ -44,7 +44,6 @@ pub struct Rule {
 pub struct GameConfig {
     pub id: String,
     pub name: String,
-    pub comm_radius_m: f32,
     #[serde(default)]
     pub teams: Vec<String>,
     pub entity_types: Vec<EntityTypeDef>,
@@ -119,18 +118,6 @@ mod tests {
         assert!(g.entity_types.iter().any(|e| e.id == "zone"));
         // Territory has no placement rules — Ready-Up gates only on claim.
         assert!(g.placement.is_empty());
-    }
-
-    #[test]
-    fn all_shipped_configs_have_positive_comm_radius() {
-        for (name, raw) in [
-            ("ctf.json", CTF_JSON),
-            ("king_of_the_hill.json", KOTH_JSON),
-            ("territory.json", TERRITORY_JSON),
-        ] {
-            let g = parse(name, raw);
-            assert!(g.comm_radius_m > 0.0, "{name}: comm_radius_m must be positive");
-        }
     }
 
     #[test]

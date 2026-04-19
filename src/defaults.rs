@@ -4,8 +4,9 @@
 //! `frontend/src/game/presentation.ts`. Obstacles live entirely in the frontend;
 //! backend uses range-only for `pfctl` reconciliation.
 
-/// Pre-game communication radius in metres (used when no game is loaded).
-pub const PRE_GAME_COMM_RADIUS_M: f32 = 12.0;
+/// Global communication radius in metres. A playing-field constant applied
+/// uniformly regardless of which game (if any) is loaded.
+pub const COMM_RADIUS_M: f32 = 15.0;
 
 /// Minimum separation between randomly-placed nodes in metres.
 pub const MIN_SEP_M: f32 = 2.5;

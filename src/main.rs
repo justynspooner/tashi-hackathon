@@ -54,18 +54,12 @@ enum Command {
         peer_label: Vec<String>,
         #[arg(long, default_value = "agent")]
         label: String,
-        #[arg(long, default_value = "carrier")]
-        role: String,
         #[arg(long, default_value = "ready")]
         status: String,
         #[arg(long, default_value_t = 50)]
         heartbeat_ms: u64,
         #[arg(long, default_value_t = 10_000)]
         stale_after_ms: u64,
-        #[arg(long)]
-        toggle_role_to: Option<String>,
-        #[arg(long, default_value_t = 5_000)]
-        toggle_after_ms: u64,
         #[arg(long)]
         state_file: Option<PathBuf>,
         #[arg(long)]
@@ -133,12 +127,9 @@ async fn main() -> anyhow::Result<()> {
             peer_pubkey,
             peer_label,
             label,
-            role,
             status,
             heartbeat_ms,
             stale_after_ms,
-            toggle_role_to,
-            toggle_after_ms,
             state_file,
             proof_dir,
             event_log,
@@ -188,12 +179,9 @@ async fn main() -> anyhow::Result<()> {
                 secret,
                 peers,
                 label,
-                role,
                 status,
                 heartbeat_ms,
                 stale_after_ms,
-                toggle_role_to,
-                toggle_after_ms,
                 Some(state_file),
                 Some(proof_dir),
                 Some(event_log),

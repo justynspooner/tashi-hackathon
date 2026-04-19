@@ -18,8 +18,7 @@ use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 
 use crate::defaults::{
-    FIELD_HEIGHT_M, FIELD_WIDTH_M, HYSTERESIS_M, MIN_SEP_M, PRE_GAME_COMM_RADIUS_M,
-    RECONCILER_TICK_MS,
+    COMM_RADIUS_M, FIELD_HEIGHT_M, FIELD_WIDTH_M, HYSTERESIS_M, MIN_SEP_M, RECONCILER_TICK_MS,
 };
 use crate::games::{self, GameConfig};
 use crate::geom;
@@ -27,9 +26,9 @@ use crate::pf::{normalize_pair, PfPartitionManager, PortPair};
 use crate::proof::ProofOfCoordination;
 
 /// Target max pairwise distance for a freshly-created swarm. One hysteresis
-/// band below the pre-game comm radius so no pair starts in the flap zone of
-/// the partition reconciler.
-const SWARM_MAX_PAIR_SEP_M: f32 = PRE_GAME_COMM_RADIUS_M - HYSTERESIS_M;
+/// band below the comm radius so no pair starts in the flap zone of the
+/// partition reconciler.
+const SWARM_MAX_PAIR_SEP_M: f32 = COMM_RADIUS_M - HYSTERESIS_M;
 use crate::protocol::{Position, SharedState};
 use crate::state::now_ms;
 
@@ -41,7 +40,6 @@ struct NodeConfig {
     bind: String,
     secret: String,
     pubkey: String,
-    role: String,
     #[serde(default)]
     initial_x: Option<f32>,
     #[serde(default)]
@@ -85,7 +83,6 @@ struct EventLogEntry {
 struct NodeInfoResponse {
     label: String,
     bind: String,
-    role: Option<String>,
     status: String,
     initial_x: Option<f32>,
     initial_y: Option<f32>,
@@ -191,7 +188,6 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         .route("/api/nodes", get(get_nodes))
         .route("/api/nodes/{label}/start", post(start_node))
         .route("/api/nodes/{label}/stop", post(stop_node))
-        .route("/api/nodes/{label}/role", post(set_role))
         .route("/api/nodes/{label}/position", post(set_position))
         .route("/api/nodes/{label}/propose-game/{game_id}", post(propose_game))
         .route("/api/nodes/{label}/vote-game/{game_id}", post(vote_game))
@@ -529,48 +525,6 @@ fn label_port_map(state: &AppState) -> HashMap<String, u16> {
     map
 }
 
-/// Pick the majority `active_game_id` across the supplied snapshots. Nodes
-/// converge to the same id via consensus once a game is loaded, so the tally
-/// is usually unanimous; ties are broken lexicographically for determinism.
-/// Returns `None` when no snapshot has a non-empty id.
-fn majority_active_game_id<'a, I>(snapshots: I) -> Option<String>
-where
-    I: IntoIterator<Item = &'a serde_json::Value>,
-{
-    let mut tally: HashMap<String, u32> = HashMap::new();
-    for snap in snapshots {
-        if let Some(id) = snap.get("active_game_id").and_then(|v| v.as_str()) {
-            if !id.is_empty() {
-                *tally.entry(id.to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-    tally
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-        .map(|(id, _)| id)
-}
-
-/// Resolve the communication radius currently in effect. When a game is
-/// loaded on the majority of nodes, its `comm_radius_m` wins; otherwise we
-/// fall back to the pre-game default.
-fn resolve_comm_radius(
-    active_id: Option<&str>,
-    configs: &HashMap<String, GameConfig>,
-) -> f32 {
-    active_id
-        .and_then(|id| configs.get(id))
-        .map(|cfg| cfg.comm_radius_m)
-        .unwrap_or(PRE_GAME_COMM_RADIUS_M)
-}
-
-fn active_comm_radius(state: &AppState) -> f32 {
-    let snaps = state.game_snapshots.lock().unwrap();
-    let active = majority_active_game_id(snaps.values());
-    drop(snaps);
-    resolve_comm_radius(active.as_deref(), &state.games.configs)
-}
-
 /// Convert the live `pfctl`-blocked port set into label-pair form so the
 /// hysteresis check can look up a pair's current state without needing the
 /// port table again. Pairs involving unknown labels (e.g. stopped nodes with
@@ -640,9 +594,10 @@ async fn partition_reconciler(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(RECONCILER_TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Track the last radius we acted on so we can log the swap when a game
-    // loads (or unloads).
-    let mut last_radius: Option<f32> = None;
+    // Comm radius is a global playing-field constant — it doesn't change
+    // when a game loads. Log it once at startup for operator visibility.
+    let radius_m = COMM_RADIUS_M;
+    println!("[partition_reconciler] comm radius -> {radius_m:.1}m");
 
     loop {
         interval.tick().await;
@@ -650,14 +605,6 @@ async fn partition_reconciler(state: Arc<AppState>) {
         let positions = snapshot_positions(&state);
         if positions.len() < 2 {
             continue;
-        }
-
-        // Phase C: use the active game's `comm_radius_m` if a game is loaded,
-        // otherwise the pre-game default.
-        let radius_m = active_comm_radius(&state);
-        if last_radius.map(|r| (r - radius_m).abs() > f32::EPSILON).unwrap_or(true) {
-            println!("[partition_reconciler] comm radius -> {radius_m:.1}m");
-            last_radius = Some(radius_m);
         }
 
         let current_blocked_ports = state.pf.blocked_pairs();
@@ -861,15 +808,12 @@ async fn verify_proof_handler(
 async fn get_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeInfoResponse>> {
     let config = state.config.lock().unwrap();
     let nodes = state.nodes.lock().unwrap();
-    let agent_states = state.agent_states.lock().unwrap();
     Json(
         config.nodes.iter().map(|n| {
             let status = if nodes.contains_key(&n.label) { "running" } else { "stopped" };
-            let role = agent_states.get(&n.label).map(|s| s.local.role.clone());
             NodeInfoResponse {
                 label: n.label.clone(),
                 bind: n.bind.clone(),
-                role,
                 status: status.to_string(),
                 initial_x: n.initial_x,
                 initial_y: n.initial_y,
@@ -932,7 +876,6 @@ fn spawn_node(state: &Arc<AppState>, label: &str) -> bool {
         .arg("--bind").arg(&node_config.bind)
         .arg("--secret").arg(&node_config.secret)
         .arg("--label").arg(label)
-        .arg("--role").arg(&node_config.role)
         .arg("--state-file").arg(&state_file)
         .arg("--proof-dir").arg(&proof_dir)
         .arg("--event-log").arg(&event_log)
@@ -1009,38 +952,6 @@ async fn stop_node(
     } else {
         Json(serde_json::json!({"status": "already_stopped"}))
     }
-}
-
-#[derive(Deserialize)]
-struct RoleRequest {
-    role: String,
-}
-
-async fn set_role(
-    State(state): State<Arc<AppState>>,
-    AxumPath(label): AxumPath<String>,
-    Json(body): Json<RoleRequest>,
-) -> Json<serde_json::Value> {
-    {
-        let mut config = state.config.lock().unwrap();
-        if let Some(node) = config.nodes.iter_mut().find(|n| n.label == label) {
-            node.role = body.role.clone();
-        }
-        let _ = std::fs::write(
-            &state.config_path,
-            serde_json::to_string_pretty(&*config).unwrap_or_default(),
-        );
-    }
-
-    // Write command file for the child process to pick up
-    let nodes = state.nodes.lock().unwrap();
-    if nodes.contains_key(&label) {
-        let cmd_file = state.project_root.join(format!("artifacts/{label}-cmd.json"));
-        let cmd_json = serde_json::json!({"command": "set_role", "role": body.role});
-        let _ = std::fs::write(&cmd_file, serde_json::to_string(&cmd_json).unwrap_or_default());
-    }
-
-    Json(serde_json::json!({"status": "ok", "role": body.role}))
 }
 
 #[derive(Deserialize)]
@@ -1261,7 +1172,6 @@ async fn create_swarm(
                 bind: format!("127.0.0.1:{port}"),
                 secret: key.to_string(),
                 pubkey: key.public().to_string(),
-                role: "carrier".into(),
                 initial_x: Some(pos.x),
                 initial_y: Some(pos.y),
             });
@@ -1487,87 +1397,6 @@ async fn clear_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn cfg(id: &str, radius: f32) -> GameConfig {
-        GameConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            comm_radius_m: radius,
-            teams: vec![],
-            entity_types: vec![],
-            placement: vec![],
-            rules: vec![],
-        }
-    }
-
-    #[test]
-    fn majority_picks_unanimous_game_id() {
-        let snaps = vec![
-            json!({"active_game_id": "ctf"}),
-            json!({"active_game_id": "ctf"}),
-            json!({"active_game_id": "ctf"}),
-        ];
-        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
-    }
-
-    #[test]
-    fn majority_ignores_empty_and_missing() {
-        let snaps = vec![
-            json!({}),
-            json!({"active_game_id": ""}),
-            json!({"active_game_id": "ctf"}),
-        ];
-        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
-    }
-
-    #[test]
-    fn majority_none_when_no_game_loaded() {
-        let snaps = vec![json!({}), json!({"active_game_id": null})];
-        assert_eq!(majority_active_game_id(snaps.iter()), None);
-    }
-
-    #[test]
-    fn majority_wins_by_count_then_lex() {
-        // 2 "ctf" vs 1 "koth" → ctf wins on count.
-        let snaps = vec![
-            json!({"active_game_id": "ctf"}),
-            json!({"active_game_id": "ctf"}),
-            json!({"active_game_id": "koth"}),
-        ];
-        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
-
-        // 1 each → lexicographic tiebreak picks "ctf" (smaller).
-        let snaps = vec![
-            json!({"active_game_id": "koth"}),
-            json!({"active_game_id": "ctf"}),
-        ];
-        assert_eq!(majority_active_game_id(snaps.iter()), Some("ctf".into()));
-    }
-
-    #[test]
-    fn resolve_radius_uses_loaded_game() {
-        let mut configs = HashMap::new();
-        configs.insert("ctf".into(), cfg("ctf", 8.0));
-        configs.insert("koth".into(), cfg("koth", 15.0));
-
-        assert_eq!(resolve_comm_radius(Some("ctf"), &configs), 8.0);
-        assert_eq!(resolve_comm_radius(Some("koth"), &configs), 15.0);
-    }
-
-    #[test]
-    fn resolve_radius_falls_back_to_pre_game() {
-        let configs: HashMap<String, GameConfig> = HashMap::new();
-        assert_eq!(resolve_comm_radius(None, &configs), PRE_GAME_COMM_RADIUS_M);
-
-        // Unknown id also falls back (defensive against stale snapshots).
-        let mut configs = HashMap::new();
-        configs.insert("ctf".into(), cfg("ctf", 8.0));
-        assert_eq!(
-            resolve_comm_radius(Some("unknown"), &configs),
-            PRE_GAME_COMM_RADIUS_M
-        );
-    }
 
     // --- Scripted hysteresis scenarios for the partition reconciler ---
     //
@@ -1692,21 +1521,6 @@ mod tests {
                 .collect();
         }
         assert!(blocked.is_empty(), "should recover after returning to close range");
-    }
-
-    #[test]
-    fn reconciler_radius_swap_re_partitions_mid_distance() {
-        // Two nodes 10m apart. Pre-game radius 12.0 → no block. CTF radius 8.0
-        // → blocked. This is the Phase C "game loaded, radius tightens" story.
-        let (mut positions, ports) = two_node_setup();
-        positions[1].1 = pos(10.0, 0.0);
-
-        let blocked: HashSet<(String, String)> = HashSet::new();
-        let desired_pre = compute_desired_blocked(&positions, &ports, &blocked, 12.0);
-        assert!(desired_pre.is_empty(), "pre-game radius 12m should keep 10m pair connected");
-
-        let desired_ctf = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
-        assert_eq!(desired_ctf.len(), 1, "CTF radius 8m should block 10m pair");
     }
 
     #[test]

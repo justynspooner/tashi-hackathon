@@ -1,7 +1,6 @@
 {
   "id": "territory",
   "name": "Territory Control",
-  "comm_radius_m": 9.0,
   "teams": ["red", "blue"],
   "entity_types": [
     { "id": "zone",   "min": 2, "max": 3, "team": null,       "visual": "zone" },

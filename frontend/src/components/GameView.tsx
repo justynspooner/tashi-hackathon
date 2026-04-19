@@ -3,13 +3,13 @@ import * as d3 from 'd3'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import type { NodeInfo } from '../types'
-import type { GameConfig, LocalGameSnapshot, Position } from '../game/types'
+import type { LocalGameSnapshot, Position } from '../game/types'
 import {
+  COMM_RADIUS_M,
   FIELD_HEIGHT_M,
   FIELD_HEIGHT_PX,
   FIELD_WIDTH_M,
   FIELD_WIDTH_PX,
-  PRE_GAME_COMM_RADIUS_M,
   PX_PER_M,
   clampToField,
   fromPxX,
@@ -24,7 +24,6 @@ import { hasLos, inRange } from '../game/geom'
 interface GameViewProps {
   nodes: NodeInfo[]
   snapshots: Record<string, LocalGameSnapshot>
-  games: GameConfig[]
   onMove: (label: string, x: number, y: number) => void | Promise<void>
   partitions: [string, string][]
 }
@@ -95,7 +94,7 @@ function buildEntityViews(
     .filter((e): e is EntityView => e != null)
 }
 
-export function GameView({ nodes, snapshots, games, onMove, partitions }: GameViewProps) {
+export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps) {
   const svgRef = useRef<SVGSVGElement | null>(null)
   const zoomLayerRef = useRef<SVGGElement | null>(null)
   // During drag, we locally override positions; on drop we commit to backend.
@@ -113,13 +112,9 @@ export function GameView({ nodes, snapshots, games, onMove, partitions }: GameVi
 
   const presentation = useMemo(() => presentationFor(activeGameId), [activeGameId])
 
-  // Comm radius: pre-game default until a game is loaded, then the active
-  // game's `comm_radius_m` — in lockstep with the backend `partition_reconciler`.
-  const commRadiusM = useMemo(() => {
-    if (!activeGameId) return PRE_GAME_COMM_RADIUS_M
-    const cfg = games.find(g => g.id === activeGameId)
-    return cfg?.comm_radius_m ?? PRE_GAME_COMM_RADIUS_M
-  }, [activeGameId, games])
+  // Comm radius is a global playing-field constant — in lockstep with the
+  // backend `partition_reconciler`.
+  const commRadiusM = COMM_RADIUS_M
 
   const entities = useMemo(
     () => buildEntityViews(nodes, snapshots),

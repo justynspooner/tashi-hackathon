@@ -20,7 +20,7 @@ export default function App() {
   const { states, refetch: refetchStates } = useAgentStates()
   const { proofs, refetch: refetchProofs } = useProofs()
   const { events, appendEvent, clearEvents } = useEventLog()
-  const { nodes, startNode, stopNode, setRole, createSwarm, destroySwarm, refetch: refetchNodes } = useNodes()
+  const { nodes, startNode, stopNode, createSwarm, destroySwarm, refetch: refetchNodes } = useNodes()
   const { partitions, togglePartition, refetch: refetchPartitions } = usePartitions()
   const { snapshots, applySnapshotUpdate, clear: clearGameState } = useGameState()
   const { games } = useGames()
@@ -111,7 +111,6 @@ export default function App() {
                 games={games}
                 onStart={startNode}
                 onStop={stopNode}
-                onSetRole={setRole}
                 onCreateSwarm={createSwarm}
                 onDestroySwarm={destroySwarm}
                 onClaimEntity={claimEntity}
@@ -136,7 +135,6 @@ export default function App() {
           <GameView
             nodes={nodes}
             snapshots={snapshots}
-            games={games}
             onMove={moveEntity}
             partitions={partitions}
           />

@@ -184,15 +184,6 @@ export function useNodes() {
     await fetchNodes()
   }, [fetchNodes])
 
-  const setRole = useCallback(async (label: string, role: string) => {
-    await fetch(`/api/nodes/${label}/role`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role }),
-    })
-    await fetchNodes()
-  }, [fetchNodes])
-
   const createSwarm = useCallback(async (count: number) => {
     await fetch('/api/swarm', {
       method: 'POST',
@@ -207,7 +198,7 @@ export function useNodes() {
     await fetchNodes()
   }, [fetchNodes])
 
-  return { nodes, startNode, stopNode, setRole, createSwarm, destroySwarm, refetch: fetchNodes }
+  return { nodes, startNode, stopNode, createSwarm, destroySwarm, refetch: fetchNodes }
 }
 
 export function usePartitions() {

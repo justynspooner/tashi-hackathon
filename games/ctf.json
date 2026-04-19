@@ -1,7 +1,6 @@
 {
   "id": "ctf",
   "name": "Capture the Flag",
-  "comm_radius_m": 8.0,
   "teams": ["red", "blue"],
   "entity_types": [
     { "id": "flag",   "min": 1, "max": 1, "team": null,       "visual": "flag" },
@@ -10,7 +9,7 @@
   ],
   "placement": [
     { "entity": "player", "requires": { "kind": "within_m_of",        "entity": "base", "same_team": true, "max_m": 2.0 } },
-    { "entity": "flag",   "requires": { "kind": "farther_than_m_from", "entity": "base",                   "min_m": 20.0 } }
+    { "entity": "flag",   "requires": { "kind": "farther_than_m_from", "entity": "base",                   "min_m": 10.0 } }
   ],
   "rules": [
     {

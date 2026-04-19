@@ -2,7 +2,6 @@ import { memo, useEffect, useRef, useMemo } from 'react'
 import * as d3 from 'd3'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Network } from 'lucide-react'
-import { roleHex, roleColor } from '@/lib/utils'
 import type { AgentState, EventLogEntry, NodeInfo } from '@/types'
 
 const VW = 600
@@ -36,10 +35,6 @@ function determineLiveness(label: string, states: AgentState[], nodes: NodeInfo[
 
 function livenessColor(liveness: string): string {
   switch (liveness) { case 'online': return '#22c55e'; default: return '#6b7280' }
-}
-
-function roleIcon(role: string): string {
-  switch (role) { case 'carrier': return '\u{1F4E6}'; case 'scout': return '\u{1F50D}'; case 'observer': return '\u{1F441}'; case 'relay': return '\u{1F4E1}'; default: return '\u{2B55}' }
 }
 
 function topoKey(nodes: NodeInfo[], states: AgentState[]): string {
@@ -174,26 +169,15 @@ export const NetworkGraph = memo(function NetworkGraph({ states, events, nodes, 
       g.append('circle').attr('class', 'inner-fill')
         .attr('r', 24).attr('fill', '#6b7280').attr('fill-opacity', 0.05)
 
-      g.append('text').attr('class', 'role-icon')
-        .attr('text-anchor', 'middle').attr('dominant-baseline', 'central')
-        .attr('font-size', '18').attr('opacity', 0.3)
-        .text('\u{2B55}')
-
       g.append('text').attr('class', 'node-label')
         .attr('text-anchor', 'middle').attr('y', 48)
         .attr('font-size', '13').attr('font-weight', '600')
         .attr('fill', 'currentColor').attr('opacity', 0.4)
         .text(node.id)
 
-      const foWidth = 120
-      const foHeight = 36
-      g.append('foreignObject')
-        .attr('class', 'role-liveness-fo')
-        .attr('x', -foWidth / 2).attr('y', 55)
-        .attr('width', foWidth).attr('height', foHeight)
-        .append('xhtml:div')
-        .attr('class', 'role-liveness')
-        .attr('style', 'display:flex;align-items:center;justify-content:center;gap:4px;width:100%;height:100%;')
+      g.append('text').attr('class', 'liveness-label')
+        .attr('text-anchor', 'middle').attr('y', 62)
+        .attr('font-size', '10').attr('fill', '#6b7280').attr('opacity', 0.8)
 
       g.append('circle').attr('class', 'status-dot')
         .attr('cx', 20).attr('cy', -20).attr('r', 5)
@@ -233,37 +217,28 @@ export const NetworkGraph = memo(function NetworkGraph({ states, events, nodes, 
 
     for (const label of labels) {
       const liveness = determineLiveness(label, states, nodes)
-      const agentState = states.find(s => s.label === label)
-      const role = agentState?.local.role ?? 'unknown'
       const color = livenessColor(liveness)
-      const rColor = roleHex(role)
       const g = svg.select(`.node-group-${label}`)
 
       g.select('.outer-ring')
         .transition().duration(600)
-        .attr('stroke', liveness === 'online' ? rColor : color)
+        .attr('stroke', color)
         .attr('stroke-dasharray', liveness === 'offline' ? '2,6' : 'none')
 
       g.select('.inner-fill')
         .transition().duration(600)
-        .attr('fill', liveness === 'online' ? rColor : color)
+        .attr('fill', color)
         .attr('fill-opacity', liveness === 'offline' ? 0.05 : 0.15)
-
-      g.select('.role-icon')
-        .transition().duration(400)
-        .attr('opacity', liveness === 'offline' ? 0.3 : 1)
-        .on('end', function() { d3.select(this).text(roleIcon(role)) })
 
       g.select('.node-label')
         .transition().duration(400)
         .attr('opacity', liveness === 'offline' ? 0.4 : 1)
 
-      const roleBadgeClasses = roleColor(role)
-      g.select('.role-liveness')
-        .html(
-          `<span class="inline-flex items-center rounded border px-1.5 py-0.5 text-[10px] font-medium ${roleBadgeClasses}">${role}</span>` +
-          `<span style="color:${color};font-size:10px;">${liveness}</span>`
-        )
+      g.select('.liveness-label')
+        .transition().duration(400)
+        .attr('fill', color)
+        .attr('opacity', liveness === 'offline' ? 0.5 : 0.9)
+        .text(liveness)
 
       g.select('.status-dot')
         .transition().duration(400)

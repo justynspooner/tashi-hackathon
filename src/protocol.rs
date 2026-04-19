@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct SharedState {
     pub peer_id: String,
     pub last_seen_ms: u64,
-    pub role: String,
     pub status: String,
 }
 

@@ -1,6 +1,6 @@
 //! Integration test: every shipped `games/*.json` config must parse through
 //! the Rust `GameConfig` types and satisfy the invariants we rely on at
-//! runtime (non-empty id, positive comm radius, min<=max for each entity).
+//! runtime (non-empty id, min<=max for each entity).
 //!
 //! This sits as an external `tests/` binary rather than inline in
 //! `games.rs` specifically so schema drift — a new field in a JSON, or a
@@ -42,7 +42,6 @@ fn every_shipped_game_has_sane_invariants() {
     let configs = load_all(&games_dir()).expect("load_all");
     for (id, cfg) in &configs {
         assert!(!cfg.id.is_empty(), "{id}: id is empty");
-        assert!(cfg.comm_radius_m > 0.0, "{id}: comm_radius_m must be positive");
         assert!(!cfg.entity_types.is_empty(), "{id}: must declare entity types");
         for et in &cfg.entity_types {
             assert!(!et.id.is_empty(), "{id}.entity_types: empty id");
@@ -107,7 +106,6 @@ fn loader_rejects_empty_id() {
         serde_json::to_string(&GameConfig {
             id: String::new(),
             name: "broken".into(),
-            comm_radius_m: 1.0,
             teams: vec![],
             entity_types: vec![],
             placement: vec![],

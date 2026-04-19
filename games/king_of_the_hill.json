@@ -1,7 +1,6 @@
 {
   "id": "king_of_the_hill",
   "name": "King of the Hill",
-  "comm_radius_m": 10.0,
   "teams": ["red", "blue"],
   "entity_types": [
     { "id": "hill",   "min": 1, "max": 1, "team": null,       "visual": "hill" },

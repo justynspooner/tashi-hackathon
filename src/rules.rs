@@ -795,7 +795,6 @@ mod tests {
         GameConfig {
             id: "ctf".into(),
             name: "CTF".into(),
-            comm_radius_m: 8.0,
             teams: vec!["red".into(), "blue".into()],
             entity_types: vec![
                 crate::games::EntityTypeDef { id: "flag".into(), min: 1, max: 1, team: None, visual: None },
@@ -821,7 +820,7 @@ mod tests {
             kind: crate::protocol::MessageKind::EntityTypeClaim,
             message_id: "m1".into(),
             sent_at_ms: 0,
-            state: crate::protocol::SharedState { peer_id: "PK_A".into(), last_seen_ms: 0, role: "".into(), status: "".into() },
+            state: crate::protocol::SharedState { peer_id: "PK_A".into(), last_seen_ms: 0, status: "".into() },
             note: None,
             game: Some(GamePayload::EntityTypeClaim { entity_type: "flag".into(), team: None }),
         };
@@ -850,7 +849,7 @@ mod tests {
             kind: crate::protocol::MessageKind::EntityTypeClaim,
             message_id: "m1".into(),
             sent_at_ms: 0,
-            state: crate::protocol::SharedState { peer_id: "PK_A".into(), last_seen_ms: 0, role: "".into(), status: "".into() },
+            state: crate::protocol::SharedState { peer_id: "PK_A".into(), last_seen_ms: 0, status: "".into() },
             note: None,
             game: Some(GamePayload::EntityTypeClaim { entity_type: "flag".into(), team: None }),
         };
@@ -862,7 +861,6 @@ mod tests {
         GameConfig {
             id: "ctf".into(),
             name: "CTF".into(),
-            comm_radius_m: 8.0,
             teams: vec!["red".into(), "blue".into()],
             entity_types: vec![
                 crate::games::EntityTypeDef { id: "flag".into(), min: 1, max: 1, team: None, visual: None },
@@ -992,7 +990,7 @@ mod tests {
             kind: crate::protocol::MessageKind::EntityTypeClaim,
             message_id: "m1".into(),
             sent_at_ms: 0,
-            state: crate::protocol::SharedState { peer_id: "PK_A".into(), last_seen_ms: 0, role: "".into(), status: "".into() },
+            state: crate::protocol::SharedState { peer_id: "PK_A".into(), last_seen_ms: 0, status: "".into() },
             note: None,
             game: Some(GamePayload::EntityTypeClaim { entity_type: "player".into(), team: None }),
         };
@@ -1048,7 +1046,6 @@ mod tests {
             state: crate::protocol::SharedState {
                 peer_id: sender_peer_id.into(),
                 last_seen_ms: observed_at_ms,
-                role: "".into(),
                 status: "".into(),
             },
             note: None,

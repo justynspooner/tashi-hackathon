@@ -17,8 +17,6 @@ function asConfig(raw: unknown, name: string): GameConfig {
   expect(typeof c.id, `${name}.id`).toBe('string')
   expect(c.id.length, `${name}.id`).toBeGreaterThan(0)
   expect(typeof c.name, `${name}.name`).toBe('string')
-  expect(typeof c.comm_radius_m, `${name}.comm_radius_m`).toBe('number')
-  expect(c.comm_radius_m, `${name}.comm_radius_m`).toBeGreaterThan(0)
   expect(Array.isArray(c.teams), `${name}.teams`).toBe(true)
   expect(Array.isArray(c.entity_types), `${name}.entity_types`).toBe(true)
   expect(c.entity_types.length, `${name}.entity_types`).toBeGreaterThan(0)

@@ -186,12 +186,12 @@ mod tests {
 
     #[test]
     fn place_connected_keeps_every_pair_within_max_sep() {
-        // Realistic swarm sizes on the 60x30 field with the pre-game comm
+        // Realistic swarm sizes on the 60x30 field with the global comm
         // radius. Every pair of nodes must start within max_sep_m so the
         // partition reconciler does not block any pair on boot.
         let field = (60.0, 30.0);
         let min_sep = 2.5;
-        let max_sep = 11.5; // PRE_GAME_COMM_RADIUS_M - HYSTERESIS_M
+        let max_sep = 14.5; // COMM_RADIUS_M - HYSTERESIS_M
         for (seed, n) in [(1u64, 3usize), (2, 5), (3, 8)] {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             let mut placed: Vec<Position> = Vec::new();

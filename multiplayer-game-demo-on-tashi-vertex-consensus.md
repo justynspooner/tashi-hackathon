@@ -118,7 +118,6 @@ Schema (sketch) — rules-relevant fields only:
 {
   "id": "ctf",
   "name": "Capture the Flag",
-  "comm_radius_m": 8,
   "teams": ["red", "blue"],
   "entity_types": [
     { "id": "flag",   "min": 1, "max": 1, "team": null,       "visual": "flag"   },
@@ -164,13 +163,13 @@ Rust evaluator provably terminating and makes per-node reproducibility easy
 to reason about. KotH and Territory exercise the same DSL via `on: "tick"`
 + `proximity_duration_s` for zone-holding.
 
-### Pre-game defaults
+### Playing-field defaults
 
 The playing field exists from the moment the first node is created, before
 any game is loaded.
 
-- **Backend** (`src/defaults.rs`, new): only `PRE_GAME_COMM_RADIUS_M = 12.0`
-  and `MIN_SEP_M = 2.5` (for random-placement min separation). The backend
+- **Backend** (`src/defaults.rs`, new): only `COMM_RADIUS_M = 15.0` and
+  `MIN_SEP_M = 2.5` (for random-placement min separation). The backend
   doesn't know field dimensions or obstacles.
 - **Frontend** (`frontend/src/game/presentation.ts`, new): `FIELD_WIDTH_M =
   60`, `FIELD_HEIGHT_M = 30`, `PX_PER_M = 20` (→ 1200×600 px canvas), and a
@@ -179,13 +178,12 @@ any game is loaded.
   gradient + no obstacles; pre-game has a neutral grey gradient + no
   obstacles. Field size is fixed across all games (pragmatic choice — keeps
   positions meaningful across game transitions).
-- When a game is loaded, `partition_reconciler` switches from
-  `PRE_GAME_COMM_RADIUS_M` to the loaded game's `comm_radius_m`. It runs
-  continuously from server startup, not gated on game state.
+- `COMM_RADIUS_M` is a global playing-field constant — it does not vary
+  per game. `partition_reconciler` uses it uniformly, running continuously
+  from server startup regardless of game state.
 - Frontend range calculations for rendering the dashed comm-edge layer use
-  the same radius (from `useGameState`), plus an in-browser LOS check
-  against the presentation's obstacles for the visual "rocks block line of
-  sight" cue.
+  the same radius, plus an in-browser LOS check against the presentation's
+  obstacles for the visual "rocks block line of sight" cue.
 
 ### Position assignment on node creation
 
@@ -360,8 +358,8 @@ the `NodeControl`/`NetworkGraph` row and `<FinalityChart/>`.
 - **Rendered in every phase**, including `NoGame`. The field is the single
   source of truth for where every node lives, from the moment it's created.
 - Fixed 1200×600 px for a 60m×30m field (`20 px/m`), pulled from
-  `frontend/src/game/presentation.ts`. Only `comm_radius_m` varies per
-  loaded game and drives the comm-edge filter.
+  `frontend/src/game/presentation.ts`. The global `COMM_RADIUS_M` drives
+  the comm-edge filter uniformly regardless of which game is loaded.
 - Per-game presentation (gradient, obstacles array) looked up by `game_id`
   from the same `presentation.ts` module. No game loaded → neutral grey
   gradient, no obstacles.
@@ -451,9 +449,9 @@ channel.
 - `file_watcher`: tail `artifacts/{label}-game.json`; emit
   `WebEvent::GameStateChanged { label, phase, game_id, snapshot }` on
   change.
-- Spawn `partition_reconciler` task at startup, using
-  `defaults::PRE_GAME_COMM_RADIUS_M` until a game is loaded, then
-  `active_game.comm_radius_m`.
+- Spawn `partition_reconciler` task at startup, using the global
+  `defaults::COMM_RADIUS_M`. The radius is a playing-field constant and
+  does not change when a game is loaded.
 
 `src/state.rs` (modify): extend `WebEvent` with `GameStateChanged`,
 `RuleViolated`, `PartitionAuto`. Surface them through the existing SSE
@@ -481,7 +479,7 @@ broadcast channel under new `type` discriminants.
    file/mpsc command extensions; `/api/games`,
    `/api/nodes/{label}/{propose,vote}-game/{id}`;
    `GameSelectOverlay`. **End state**: propose, vote, "CTF loaded" on
-   every node; active `comm_radius_m` swaps in and reconciler reflects it.
+   every node; reconciler continues against the global `COMM_RADIUS_M`.
 4. **Phase D — claims, placement & ready-up.** `EntityTypeClaim` with
    cardinality rejection; placement-constraint rules; `ReadyUp`; entity
    visuals swap on claim; entity-type assignment UI on NodeControl cards;
@@ -510,8 +508,8 @@ broadcast channel under new `type` discriminants.
   range-only `in_range`/`connected_pairs` + `place_randomly_without_overlap`.
   No LOS (obstacles are frontend-only).
 - `/Users/justyn/dev/tashi/hackathon-warm-up/src/defaults.rs` **(new)** —
-  `PRE_GAME_COMM_RADIUS_M`, `MIN_SEP_M`, and the hardcoded field dims used
-  for random placement (kept in lockstep with frontend presentation).
+  `COMM_RADIUS_M`, `MIN_SEP_M`, and the hardcoded field dims used for
+  random placement (kept in lockstep with frontend presentation).
 - `/Users/justyn/dev/tashi/hackathon-warm-up/src/web.rs` — new endpoints,
   `file_watcher` game-json tailer, `partition_reconciler` task.
 - `/Users/justyn/dev/tashi/hackathon-warm-up/src/state.rs` — new `WebEvent`

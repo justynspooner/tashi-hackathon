@@ -1,7 +1,7 @@
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
 import { ShieldCheck, ShieldX } from 'lucide-react'
-import { kindBadgeVariant, roleColor } from '@/lib/utils'
+import { kindBadgeVariant } from '@/lib/utils'
 import type { ProofOfCoordination, VerifyResult } from '@/types'
 
 export function ProofDetail({
@@ -82,14 +82,10 @@ export function ProofDetail({
                 </Badge>
                 <span className="font-mono text-muted-foreground">{tx.message_id}</span>
               </div>
-              <div className="grid grid-cols-3 gap-2 mt-2">
+              <div className="grid grid-cols-2 gap-2 mt-2">
                 <div>
                   <span className="text-muted-foreground">Peer:</span>{' '}
                   {tx.state.peer_id.slice(0, 12)}...
-                </div>
-                <div>
-                  <span className="text-muted-foreground">Role:</span>{' '}
-                  <Badge variant="outline" className={`text-xs ${roleColor(tx.state.role)}`}>{tx.state.role}</Badge>
                 </div>
                 <div>
                   <span className="text-muted-foreground">Status:</span>{' '}

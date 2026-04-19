@@ -30,7 +30,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Power, PowerOff, Server, Plus, Trash2, Check, Flag } from 'lucide-react'
-import { timeSince, roleColor } from '@/lib/utils'
+import { timeSince } from '@/lib/utils'
 import type { AgentState, EventLogEntry, NodeInfo } from '@/types'
 import type {
   EntityRecord,
@@ -39,8 +39,6 @@ import type {
   LocalGameSnapshot,
 } from '@/game/types'
 import { teamColor } from '@/game/presentation'
-
-const AVAILABLE_ROLES = ['carrier', 'scout', 'observer', 'relay']
 
 const TAG_COLORS: Record<string, string> = {
   BOOT: 'text-slate-400',
@@ -393,7 +391,6 @@ const NodeCard = memo(function NodeCard({
   canonicalEntities,
   onStart,
   onStop,
-  onSetRole,
   onClaimEntity,
   onReadyUp,
 }: {
@@ -408,7 +405,6 @@ const NodeCard = memo(function NodeCard({
   canonicalEntities: Record<string, EntityRecord>
   onStart: (label: string) => void
   onStop: (label: string) => void
-  onSetRole: (label: string, role: string) => void
   onClaimEntity: (label: string, entityType: string, team: string | null) => Promise<void>
   onReadyUp: (label: string) => Promise<void>
 }) {
@@ -439,32 +435,35 @@ const NodeCard = memo(function NodeCard({
         </div>
       </CardHeader>
       <CardContent className="px-3 pb-2 pt-0 flex-1 flex flex-col gap-1.5">
-        <div className="flex items-center gap-1.5">
-          <Select
-            value={node.role ?? ''}
-            onValueChange={(value) => value && onSetRole(node.label, value)}
-          >
-            <SelectTrigger className={`h-5 text-[10px] flex-1 px-1.5 ${node.role ? roleColor(node.role) : ''}`}>
-              <SelectValue placeholder="role" />
-            </SelectTrigger>
-            <SelectContent>
-              {AVAILABLE_ROLES.map(role => (
-                <SelectItem key={role} value={role}>
-                  <span className={`px-1 rounded ${roleColor(role)}`}>{role}</span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
         {agentState && (
-          <div className="text-[10px] border-t pt-1 space-y-0.5">
+          <div className="text-[10px] space-y-0.5">
             {agentState.peers && Object.entries(agentState.peers).sort(([, a], [, b]) => (peerIdToLabel[a.peer_id] ?? a.peer_id).localeCompare(peerIdToLabel[b.peer_id] ?? b.peer_id)).map(([peerId, peer]) => {
               const isStale = now - peer.last_seen_ms > 15_000
+              const peerLabel = peerIdToLabel[peer.peer_id]
+              const peerEntity = peerLabel ? canonicalEntities[peerLabel] : undefined
+              const entityType = peerEntity?.entity_type ?? null
+              const entityTeam = peerEntity?.team ?? null
               return (
                 <div key={peerId} className={`flex items-center gap-1 ${isStale ? 'opacity-50' : ''}`}>
-                  <span className="text-muted-foreground w-12 shrink-0 truncate">{peerIdToLabel[peer.peer_id] ?? shortId(peer.peer_id)}</span>
-                  <Badge variant="outline" className={`text-[9px] px-0.5 py-0 leading-tight ${roleColor(peer.role)}`}>{peer.role}</Badge>
+                  <span className="text-muted-foreground w-12 shrink-0 truncate">{peerLabel ?? shortId(peer.peer_id)}</span>
+                  {entityType ? (
+                    <Badge variant="outline" className="text-[9px] px-0.5 py-0 leading-tight gap-0.5">
+                      <span>{entityGlyph(entityType)}</span>
+                      <span>{entityType}</span>
+                      {entityTeam && (
+                        <span
+                          className="px-0.5 rounded text-[9px] font-semibold"
+                          style={{ backgroundColor: teamColor(entityTeam) + '30', color: teamColor(entityTeam) }}
+                        >
+                          {entityTeam}
+                        </span>
+                      )}
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-[9px] px-0.5 py-0 leading-tight text-muted-foreground">
+                      unclaimed
+                    </Badge>
+                  )}
                   {isStale && <Badge variant="destructive" className="text-[8px] px-0.5 py-0 leading-tight">stale</Badge>}
                   <span className="text-muted-foreground ml-auto">{timeSince(peer.last_seen_ms)}</span>
                 </div>
@@ -505,7 +504,6 @@ interface Props {
   games: GameConfig[]
   onStart: (label: string) => Promise<void>
   onStop: (label: string) => Promise<void>
-  onSetRole: (label: string, role: string) => Promise<void>
   onCreateSwarm: (count: number) => Promise<void>
   onDestroySwarm: () => Promise<void>
   onClaimEntity: (label: string, entityType: string, team: string | null) => Promise<void>
@@ -520,7 +518,6 @@ export const NodeControl = memo(function NodeControl({
   games,
   onStart,
   onStop,
-  onSetRole,
   onCreateSwarm,
   onDestroySwarm,
   onClaimEntity,
@@ -718,7 +715,6 @@ export const NodeControl = memo(function NodeControl({
               canonicalEntities={canonicalEntities}
               onStart={handleStart}
               onStop={handleStop}
-              onSetRole={onSetRole}
               onClaimEntity={onClaimEntity}
               onReadyUp={onReadyUp}
             />

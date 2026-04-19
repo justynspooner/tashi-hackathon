@@ -12,7 +12,7 @@ export const PX_PER_M = 20
 export const FIELD_WIDTH_PX = FIELD_WIDTH_M * PX_PER_M
 export const FIELD_HEIGHT_PX = FIELD_HEIGHT_M * PX_PER_M
 
-export const PRE_GAME_COMM_RADIUS_M = 12
+export const COMM_RADIUS_M = 15
 
 export interface Obstacle {
   x: number
