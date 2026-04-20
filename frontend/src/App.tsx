@@ -4,11 +4,9 @@ import { Badge } from '@/components/ui/badge'
 import { ProofList } from '@/components/ProofList'
 import { EventTimeline } from '@/components/EventTimeline'
 import { EventLog } from '@/components/EventLog'
-import { NetworkGraph } from '@/components/NetworkGraph'
 import { NodeControl } from '@/components/NodeControl'
 import { FinalityChart } from '@/components/FinalityChart'
 import { GameView } from '@/components/GameView'
-import { GameSelectOverlay } from '@/components/GameSelectOverlay'
 import { ConsensusStalledBanner } from '@/components/ConsensusStalledBanner'
 import { Button } from '@/components/ui/button'
 import { useAgentStates, useProofs, useEventLog, useNodes, usePartitions, useSSE } from '@/hooks/useApi'
@@ -100,43 +98,37 @@ export default function App() {
 
       <div className="flex flex-1 min-h-0">
         <main className="flex-1 min-w-0 p-6 overflow-y-auto space-y-6">
-          {/* Node control (2/3) + Network topology (1/3) */}
-          <div className="flex gap-6 items-start">
-            <div className="w-2/3 min-w-0">
-              <NodeControl
-                nodes={nodes}
-                states={states}
-                events={events}
-                snapshots={snapshots}
-                games={games}
-                onStart={startNode}
-                onStop={stopNode}
-                onCreateSwarm={createSwarm}
-                onDestroySwarm={destroySwarm}
-                onClaimEntity={claimEntity}
-                onReadyUp={readyUp}
-              />
-            </div>
-            <div className="w-1/3 shrink-0">
-              <NetworkGraph states={states} events={events} nodes={nodes} partitions={partitions} onTogglePartition={togglePartition} />
-            </div>
-          </div>
-
-          {/* Game selection — full width, above the playing field */}
-          <GameSelectOverlay
+          {/* Node control — full width (network topology is now drawn
+              directly on top of the playing field below) */}
+          <NodeControl
             nodes={nodes}
+            states={states}
+            events={events}
             snapshots={snapshots}
             games={games}
-            onPropose={proposeGame}
-            onVote={voteGame}
+            onStart={startNode}
+            onStop={stopNode}
+            onCreateSwarm={createSwarm}
+            onDestroySwarm={destroySwarm}
+            onProposeGame={proposeGame}
+            onVoteGame={voteGame}
+            onClaimEntity={claimEntity}
+            onReadyUp={readyUp}
           />
 
-          {/* Playing field — full width */}
+          {/* Playing field — full width. Now also hosts the comm graph: green
+              lines between connected peers, red dashed lines for any pair
+              without a link (user-severed or out of range). Tap any edge to
+              toggle a manual sever. */}
           <GameView
             nodes={nodes}
             snapshots={snapshots}
             onMove={moveEntity}
             partitions={partitions}
+            events={events}
+            states={states}
+            games={games}
+            onTogglePartition={togglePartition}
           />
 
           {/* Consensus finality — full width */}

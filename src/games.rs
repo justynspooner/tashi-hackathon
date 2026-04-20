@@ -51,6 +51,12 @@ pub struct GameConfig {
     pub placement: Vec<PlacementRule>,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// Optional hard time limit in seconds. Measured from the consensus-pinned
+    /// `countdown_zero_ns + 3s` moment when gameplay transitions to `Playing`.
+    /// Consumed by the `game_time_elapsed_s` predicate and surfaced to the UI
+    /// as an MM:SS countdown. `None` means the game has no built-in timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<u64>,
 }
 
 pub fn load_all(dir: &Path) -> anyhow::Result<HashMap<String, GameConfig>> {
@@ -100,7 +106,20 @@ mod tests {
         assert!(g.entity_types.iter().any(|e| e.id == "flag" && e.max == 1));
         assert!(g.entity_types.iter().any(|e| e.id == "base" && e.team.as_deref() == Some("per_team")));
         assert_eq!(g.placement.len(), 2);
-        assert!(g.rules.iter().any(|r| r.id == "flag_capture"));
+        // 10-minute timed hold-the-flag scoring:
+        //   - `mark_holding` stamps `flag.holding_team` for the UI's current-holder pill.
+        //   - `hold_pulse` writes a fresh `flag.hold_pulse_ms` every tick the
+        //     flag sits at a base, so the delta-triggered `hold_score` rule
+        //     increments the team's score once per node per tick (consensus
+        //     converged).
+        //   - `time_limit` fires on the flag after `duration_s` elapses and
+        //     ends the game with the highest-score team as winner.
+        assert_eq!(g.duration_s, Some(600));
+        let rule_ids: Vec<&str> = g.rules.iter().map(|r| r.id.as_str()).collect();
+        assert!(rule_ids.contains(&"mark_holding"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"hold_pulse"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"hold_score"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"time_limit"), "rules: {rule_ids:?}");
     }
 
     #[test]

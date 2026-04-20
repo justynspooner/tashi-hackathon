@@ -110,6 +110,7 @@ fn loader_rejects_empty_id() {
             entity_types: vec![],
             placement: vec![],
             rules: vec![],
+            duration_s: None,
         })
         .unwrap(),
     )

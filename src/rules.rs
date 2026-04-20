@@ -218,6 +218,14 @@ enum Predicate {
     PhysicallyPlausible {
         max_velocity_m_per_s: f32,
     },
+    /// True once the current `Playing` phase has been running for at least
+    /// `min_s` seconds. Start point is the consensus-pinned
+    /// `countdown_zero_ns + 3_000_000_000ns` moment that `handle_vertex_message`
+    /// uses to flip `CountingDown → Playing`, so every node computes an
+    /// identical elapsed time from the same anchor. If no countdown has been
+    /// pinned yet (game hasn't started, or `countdown_zero_ns` is `None`), the
+    /// predicate is `false`.
+    GameTimeElapsedS { min_s: u64 },
 }
 
 /// Effect AST. Anything a game rule's `effect` block can express.
@@ -399,6 +407,21 @@ fn eval_predicate(
             // spuriously.
             false
         }
+        Predicate::GameTimeElapsedS { min_s } => {
+            // Anchor is `countdown_zero_ns + 3s` — the consensus timestamp at
+            // which `handle_vertex_message` flipped the phase to `Playing`.
+            // Nanoseconds since UNIX epoch are directly comparable to the
+            // millisecond-precision `now_ms` supplied by the runtime (both
+            // derive from the same wall clock), so converting the anchor ns →
+            // ms and subtracting gives a consistent elapsed-play duration.
+            let Some(zero_ns) = ctx.local.countdown_zero_ns else {
+                return false;
+            };
+            let start_ns = zero_ns.saturating_add(3_000_000_000);
+            let start_ms = (start_ns / 1_000_000) as u64;
+            let elapsed_ms = ctx.now_ms.saturating_sub(start_ms);
+            elapsed_ms >= min_s.saturating_mul(1_000)
+        }
     }
 }
 
@@ -410,7 +433,7 @@ fn apply_effect(
 ) -> RuleDecision {
     match e {
         Effect::SetProperty { target_entity_type, key, value } => {
-            let resolved = resolve_template(value, self_entity);
+            let resolved = resolve_template(value, self_entity, ctx);
             // Emit one patch per entity matching target_entity_type.
             let patches: Vec<StatePatch> = ctx
                 .local
@@ -438,9 +461,15 @@ fn apply_effect(
             }
         }
         Effect::EndGame { winner_team, reason } => {
-            // "self.team" resolves to the triggering actor's team.
+            // Special winner_team resolvers:
+            //   * `"self.team"` — use the triggering actor's team.
+            //   * `"highest_score"` — pick the team with the strictly highest
+            //     score in `ctx.local.scores`. Ties resolve to `None` so the
+            //     UI can render "draw" rather than picking arbitrarily.
+            //   * any other string — used verbatim.
             let resolved = match winner_team.as_deref() {
                 Some("self.team") => self_entity.team.clone(),
+                Some("highest_score") => highest_scoring_team(ctx),
                 Some(other) => Some(other.to_string()),
                 None => None,
             };
@@ -460,13 +489,61 @@ fn apply_effect(
     }
 }
 
-fn resolve_template(v: &serde_json::Value, self_entity: &EntityRecord) -> serde_json::Value {
+/// Resolve a templated effect value against the current rule context.
+///
+/// Supported string templates:
+///   * `"self.team"` — replaced with the triggering actor's team (empty
+///     string if they're teamless).
+///   * `"now_ms"` — replaced with `ctx.now_ms` as a JSON number. Useful for
+///     "pulse" rules whose `set_property` must emit a new value every tick
+///     so `property_changed` fires on the delta side. Single-source (only
+///     the rule's originating node emits), so nodes don't diverge on the
+///     value.
+///
+/// Any other value is returned unchanged.
+fn resolve_template(
+    v: &serde_json::Value,
+    self_entity: &EntityRecord,
+    ctx: &RuleContext,
+) -> serde_json::Value {
     if let Some(s) = v.as_str() {
         if s == "self.team" {
             return serde_json::Value::String(self_entity.team.clone().unwrap_or_default());
         }
+        if s == "now_ms" {
+            return serde_json::Value::Number(serde_json::Number::from(ctx.now_ms));
+        }
     }
     v.clone()
+}
+
+/// Pick the team with the strictly highest `ctx.local.scores` value, skipping
+/// bookkeeping keys (prefixed `__`). Returns `None` when no team has scored
+/// or when the top score is tied across multiple teams — callers (e.g.
+/// `end_game`) then render this as a draw.
+fn highest_scoring_team(ctx: &RuleContext) -> Option<String> {
+    let mut top: Option<(String, i64)> = None;
+    let mut tied = false;
+    for (team, score) in &ctx.local.scores {
+        if team.starts_with("__") {
+            continue;
+        }
+        match &top {
+            Some((_, best)) if *score > *best => {
+                top = Some((team.clone(), *score));
+                tied = false;
+            }
+            Some((_, best)) if *score == *best => {
+                tied = true;
+            }
+            None => top = Some((team.clone(), *score)),
+            _ => {}
+        }
+    }
+    if tied {
+        return None;
+    }
+    top.map(|(t, _)| t)
 }
 
 // --- Proximity tracker maintenance ---
@@ -803,6 +880,7 @@ mod tests {
             ],
             placement: vec![],
             rules: vec![],
+            duration_s: None,
         }
     }
 
@@ -887,6 +965,7 @@ mod tests {
                 },
             ],
             rules: vec![],
+            duration_s: None,
         }
     }
 
@@ -1339,6 +1418,291 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d, RuleDecision::Reject { .. })),
             "decisions: {decisions:?}"
+        );
+    }
+
+    // --- Time limit / highest_score / now_ms template tests ---
+
+    /// Build a `ctf`-shaped game with a single `on: tick` rule that fires
+    /// once `game_time_elapsed_s >= min_s` and calls `end_game` with the
+    /// given winner resolver. Kept local to these tests so the predicate is
+    /// exercised without dragging in the full shipped ctf.json.
+    fn ctf_with_time_limit(min_s: u64, winner_team: &str) -> GameConfig {
+        let mut g = ctf_with_placement();
+        g.duration_s = Some(min_s);
+        g.rules.push(crate::games::Rule {
+            id: "time_limit".into(),
+            on: "tick".into(),
+            when: serde_json::json!({
+                "kind": "all",
+                "of": [
+                    { "kind": "entity_is", "entity_type": "flag" },
+                    { "kind": "game_time_elapsed_s", "min_s": min_s }
+                ]
+            }),
+            effect: serde_json::json!({
+                "kind": "end_game",
+                "winner_team": winner_team,
+                "reason": "test time limit"
+            }),
+        });
+        g
+    }
+
+    /// Anchor the elapsed-time clock: `countdown_zero_ns` = 0, so play
+    /// starts at `0 + 3_000_000_000ns = 3s` past the UNIX epoch. A `now_ms`
+    /// of `3_000 + elapsed_ms` therefore maps directly to `elapsed_ms`
+    /// seconds of play. Tests set `now_ms` relative to this anchor.
+    fn state_with_countdown_zero() -> LocalGameState {
+        let mut s = LocalGameState::new("me".into(), "PK_ME".into(), None);
+        s.active_game_id = Some("ctf".into());
+        s.countdown_zero_ns = Some(0);
+        s
+    }
+
+    #[test]
+    fn game_time_elapsed_is_false_before_threshold() {
+        let game = ctf_with_time_limit(600, "highest_score");
+        let mut state = state_with_countdown_zero();
+        // Flag exists and is the local entity.
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        // 100s into play — start is at 3000ms, elapsed = 100_000ms.
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 + 100_000 };
+        let decisions = tick(&ctx);
+        assert!(
+            decisions.is_empty(),
+            "time_limit should not fire before threshold: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn game_time_elapsed_fires_end_game_at_threshold() {
+        let game = ctf_with_time_limit(600, "highest_score");
+        let mut state = state_with_countdown_zero();
+        state.scores.insert("red".into(), 42);
+        state.scores.insert("blue".into(), 17);
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        // 600s into play → 600_000ms elapsed past the 3s countdown offset.
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 + 600_000 };
+        let decisions = tick(&ctx);
+        let ends: Vec<_> = decisions
+            .iter()
+            .filter_map(|d| match d {
+                RuleDecision::End { winner_team, reason } => {
+                    Some((winner_team.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1, "expected one End decision: {decisions:?}");
+        let (winner, reason) = &ends[0];
+        // highest_score picks red (42 > 17).
+        assert_eq!(winner.as_deref(), Some("red"), "decisions: {decisions:?}");
+        assert!(reason.contains("time limit"), "reason: {reason}");
+    }
+
+    #[test]
+    fn game_time_elapsed_is_false_without_countdown() {
+        // countdown_zero_ns = None → predicate always false regardless of now_ms.
+        let game = ctf_with_time_limit(1, "highest_score");
+        let mut state = LocalGameState::new("me".into(), "PK_ME".into(), None);
+        state.active_game_id = Some("ctf".into());
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 1_000_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "no countdown → no time limit: {decisions:?}");
+    }
+
+    #[test]
+    fn highest_score_resolves_to_strict_leader() {
+        let game = ctf_with_time_limit(1, "highest_score");
+        let mut state = state_with_countdown_zero();
+        // Only blue has scored — it wins outright.
+        state.scores.insert("blue".into(), 5);
+        state.scores.insert("red".into(), 0);
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 + 1_500 };
+        let decisions = tick(&ctx);
+        let winner = decisions
+            .iter()
+            .find_map(|d| match d {
+                RuleDecision::End { winner_team, .. } => winner_team.clone(),
+                _ => None,
+            });
+        assert_eq!(winner.as_deref(), Some("blue"), "decisions: {decisions:?}");
+    }
+
+    #[test]
+    fn highest_score_ties_resolve_to_none() {
+        let game = ctf_with_time_limit(1, "highest_score");
+        let mut state = state_with_countdown_zero();
+        state.scores.insert("blue".into(), 3);
+        state.scores.insert("red".into(), 3);
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 + 1_500 };
+        let decisions = tick(&ctx);
+        // Tie → End decision still fires but winner_team == None (the UI
+        // renders this as "draw").
+        let end = decisions
+            .iter()
+            .find_map(|d| match d {
+                RuleDecision::End { winner_team, .. } => Some(winner_team.clone()),
+                _ => None,
+            });
+        assert_eq!(end, Some(None), "tie should resolve to None: {decisions:?}");
+    }
+
+    #[test]
+    fn highest_score_ignores_bookkeeping_keys() {
+        // Keys prefixed `__` are internal (e.g. `__countdown_start_ms`) and
+        // must never win the "highest score" tiebreak over a real team.
+        let game = ctf_with_time_limit(1, "highest_score");
+        let mut state = state_with_countdown_zero();
+        state.scores.insert("__internal".into(), 999);
+        state.scores.insert("red".into(), 1);
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 + 1_500 };
+        let decisions = tick(&ctx);
+        let winner = decisions
+            .iter()
+            .find_map(|d| match d {
+                RuleDecision::End { winner_team, .. } => winner_team.clone(),
+                _ => None,
+            });
+        assert_eq!(winner.as_deref(), Some("red"), "decisions: {decisions:?}");
+    }
+
+    #[test]
+    fn set_property_now_ms_resolves_to_ctx_now() {
+        // Rule: on tick, a base within 1m of the flag for ≥1s emits a delta
+        // patching flag.hold_pulse_ms to the current now_ms. Verifies that
+        // the `now_ms` template flows through set_property end-to-end and
+        // produces a numeric JSON value (not the literal string).
+        let mut game = ctf_with_placement();
+        game.rules.push(crate::games::Rule {
+            id: "hold_pulse".into(),
+            on: "tick".into(),
+            when: serde_json::json!({
+                "kind": "all",
+                "of": [
+                    { "kind": "entity_is", "entity_type": "base" },
+                    { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 1 }
+                ]
+            }),
+            effect: serde_json::json!({
+                "kind": "set_property",
+                "target_entity_type": "flag",
+                "key": "hold_pulse_ms",
+                "value": "now_ms"
+            }),
+        });
+
+        let mut state = LocalGameState::new("me".into(), "PK_ME".into(), None);
+        state.active_game_id = Some("ctf".into());
+        // Local = red base; flag sits 0.5m away.
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("base"), Some("red"), Some((0.0, 0.0))),
+        );
+        state.entities.insert(
+            "flg".into(),
+            entity("flg", "PK_FLG", Some("flag"), None, Some((0.5, 0.0))),
+        );
+        // Seed the proximity tracker so the 1s duration is already satisfied.
+        update_proximity(&mut state, &game, 0);
+
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 42_000 };
+        let decisions = tick(&ctx);
+        let patches = decisions
+            .iter()
+            .find_map(|d| match d {
+                RuleDecision::Emit { rule_id, patches } if rule_id == "hold_pulse" => {
+                    Some(patches.clone())
+                }
+                _ => None,
+            })
+            .expect("expected hold_pulse emit");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].key, "hold_pulse_ms");
+        assert_eq!(patches[0].target_peer_id, "PK_FLG");
+        assert_eq!(patches[0].value, serde_json::json!(42_000u64));
+    }
+
+    #[test]
+    fn hold_pulse_delta_increments_holding_team_score() {
+        // Integration-flavoured test: once the base's hold_pulse delta lands,
+        // every node's `on: game_state_delta` handler fires the score rule,
+        // resolving `self.team` against the delta sender (the base's team).
+        let mut game = ctf_with_placement();
+        game.rules.push(crate::games::Rule {
+            id: "hold_score".into(),
+            on: "game_state_delta".into(),
+            when: serde_json::json!({
+                "kind": "property_changed",
+                "target_entity_type": "flag",
+                "key": "hold_pulse_ms"
+            }),
+            effect: serde_json::json!({
+                "kind": "increment_score",
+                "team": "self.team",
+                "by": 1
+            }),
+        });
+
+        // Observer node — doesn't matter what entity it holds, rules fire
+        // off the sender's identity, not local self.
+        let mut state = LocalGameState::new("me".into(), "PK_ME".into(), None);
+        state.active_game_id = Some("ctf".into());
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("player"), Some("blue"), Some((50.0, 10.0))),
+        );
+        // Delta sender = red base.
+        state.entities.insert(
+            "base_r".into(),
+            entity("base_r", "PK_BR", Some("base"), Some("red"), Some((0.0, 0.0))),
+        );
+        state.entities.insert(
+            "flg".into(),
+            entity("flg", "PK_FLG", Some("flag"), None, Some((0.5, 0.0))),
+        );
+
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 1_234 };
+        let patches = vec![StatePatch {
+            target_peer_id: "PK_FLG".into(),
+            key: "hold_pulse_ms".into(),
+            value: serde_json::json!(1_234u64),
+        }];
+        let decisions = evaluate_delta(&ctx, "PK_BR", &patches);
+        let scored: Vec<_> = decisions
+            .iter()
+            .filter_map(|d| match d {
+                RuleDecision::IncrementScore { team, by, .. } => Some((team.clone(), *by)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            scored,
+            vec![("red".to_string(), 1)],
+            "hold_pulse delta should score the sender's team: {decisions:?}"
         );
     }
 }

@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as d3 from 'd3'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import type { NodeInfo } from '../types'
-import type { LocalGameSnapshot, Position } from '../game/types'
+import type { AgentState, EventLogEntry, NodeInfo } from '../types'
+import type { GameConfig, LocalGameSnapshot, Position } from '../game/types'
 import {
   COMM_RADIUS_M,
   FIELD_HEIGHT_M,
@@ -26,6 +26,15 @@ interface GameViewProps {
   snapshots: Record<string, LocalGameSnapshot>
   onMove: (label: string, x: number, y: number) => void | Promise<void>
   partitions: [string, string][]
+  /** Event log stream — used to drive heartbeat/action/state animations. */
+  events: EventLogEntry[]
+  /** Agent states — used to detect liveness (pulse colour vs stopped). */
+  states: AgentState[]
+  /** All loaded game configs — used to look up `duration_s` for the active
+   *  game so the header can render an MM:SS countdown. */
+  games: GameConfig[]
+  /** Toggle a manual partition between two nodes. */
+  onTogglePartition: (a: string, b: string) => void | Promise<void>
 }
 
 interface EntityView {
@@ -94,14 +103,31 @@ function buildEntityViews(
     .filter((e): e is EntityView => e != null)
 }
 
-export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps) {
+export function GameView({
+  nodes,
+  snapshots,
+  onMove,
+  partitions,
+  events,
+  states,
+  games,
+  onTogglePartition,
+}: GameViewProps) {
   const svgRef = useRef<SVGSVGElement | null>(null)
   const zoomLayerRef = useRef<SVGGElement | null>(null)
+  const effectsLayerRef = useRef<SVGGElement | null>(null)
   // During drag, we locally override positions; on drop we commit to backend.
   const [dragOverrides, setDragOverrides] = useState<Record<string, Position>>({})
   // Current zoom transform — stored so the drag handlers below can compensate
   // for pan/zoom when converting pointer coordinates back to field metres.
   const transformRef = useRef<{ k: number; x: number; y: number }>({ k: 1, x: 0, y: 0 })
+  // Stable drag behaviour built once on mount; re-attached to entity groups
+  // only when the set of entities changes (see below).
+  const dragBehaviorRef = useRef<d3.DragBehavior<SVGGElement, unknown, unknown> | null>(null)
+  // Always-latest `onMove` callback so the drag-end handler doesn't need the
+  // zoom/drag setup to re-run on every prop change.
+  const onMoveRef = useRef(onMove)
+  useEffect(() => { onMoveRef.current = onMove })
 
   const activeGameId = useMemo<string | null>(() => {
     for (const snap of Object.values(snapshots)) {
@@ -119,6 +145,15 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
   const entities = useMemo(
     () => buildEntityViews(nodes, snapshots),
     [nodes, snapshots],
+  )
+
+  // Stable key that only changes when the *set* of entities (by label) changes,
+  // not when their positions / running state / claims change. Used to gate the
+  // drag-reattach effect below so we don't reinstall d3 behaviours on every
+  // snapshot tick.
+  const entityLabelsKey = useMemo(
+    () => entities.map(e => e.label).sort().join(','),
+    [entities],
   )
 
   // Effective positions: drag overrides take precedence.
@@ -140,9 +175,13 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
     return s
   }, [partitions])
 
-  // Compute comm edges (pairs that are in range + LOS).
+  // Compute edges for every pair of entities. Pairs that are out of range,
+  // blocked by an obstacle, or marked partitioned by the backend are shown as
+  // red dashed "severed" lines; in-range LOS-clear pairs that aren't in the
+  // partition set are shown as green comm links. All edges are clickable to
+  // toggle a manual sever.
   const commEdges = useMemo(() => {
-    const edges: { a: string; b: string; partitioned: boolean }[] = []
+    const edges: { a: string; b: string; connected: boolean }[] = []
     for (let i = 0; i < entities.length; i++) {
       for (let j = i + 1; j < entities.length; j++) {
         const ea = entities[i]
@@ -150,16 +189,16 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
         const pa = effectivePos[ea.label]
         const pb = effectivePos[eb.label]
         if (!pa || !pb) continue
-        if (!inRange(pa, pb, commRadiusM)) continue
-        if (!hasLos(pa, pb, presentation.obstacles)) continue
         const key = ea.label < eb.label ? `${ea.label}|${eb.label}` : `${eb.label}|${ea.label}`
-        edges.push({ a: ea.label, b: eb.label, partitioned: partitionedSet.has(key) })
+        const inLosRange = inRange(pa, pb, commRadiusM) && hasLos(pa, pb, presentation.obstacles)
+        const partitioned = partitionedSet.has(key)
+        edges.push({ a: ea.label, b: eb.label, connected: inLosRange && !partitioned })
       }
     }
     return edges
   }, [entities, effectivePos, commRadiusM, presentation.obstacles, partitionedSet])
 
-  // Set up D3 drag + zoom behaviour.
+  // Set up D3 drag + zoom behaviour ONCE on mount.
   //
   // Zoom is applied as a transform on an inner `<g class="zoom-layer">` so
   // the SVG background and size don't change. Drag events use the current
@@ -168,6 +207,13 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
   //
   // A filter on the zoom prevents it from grabbing pointer events that start
   // on an entity group — otherwise the zoom and drag race for the gesture.
+  //
+  // IMPORTANT: this effect used to depend on `[onMove, entities]`, which made
+  // it re-run on every SSE snapshot tick (entities is derived from snapshots).
+  // Each re-run allocated fresh d3 behaviours and rewrote listener state on the
+  // SVG and every entity <g>, which thrashed the GC and eventually tripped the
+  // renderer's memory limit ("Aw, Snap!" / error code 5). We now read `onMove`
+  // through a ref and reattach drag lazily when the entity *set* changes.
   useEffect(() => {
     if (!svgRef.current || !zoomLayerRef.current) return
     const svg = d3.select(svgRef.current)
@@ -178,10 +224,12 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
       .scaleExtent([0.5, 3])
       .filter(event => {
         // Let mousedown/touchstart on an entity fall through to the drag
-        // handler. Wheels and background drags still pan/zoom.
+        // handler, and on a comm edge fall through to its click handler.
+        // Wheels and background drags still pan/zoom.
         if (event.type === 'wheel') return true
         const target = event.target as Element | null
         if (target?.closest('g.entity-group')) return false
+        if (target?.closest('g.comm-edge')) return false
         return !event.ctrlKey && !event.button
       })
       .on('zoom', event => {
@@ -234,17 +282,201 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
           delete copy[label]
           return copy
         })
-        void onMove(label, p.x, p.y)
+        // Via ref so we always call the latest onMove without reinstalling.
+        void onMoveRef.current(label, p.x, p.y)
       })
 
+    dragBehaviorRef.current = drag
     svg.selectAll<SVGGElement, unknown>('g.entity-group').call(drag)
 
     return () => {
       svg.on('.zoom', null)
+      svg.selectAll<SVGGElement, unknown>('g.entity-group').on('.drag', null)
+      dragBehaviorRef.current = null
     }
-  }, [onMove, entities])
+  }, [])
+
+  // Re-attach the drag behaviour whenever the entity *set* changes (new node
+  // added / removed). Position updates and claim updates don't invalidate this
+  // — React keeps the same <g> DOM node when the React key is stable, and d3's
+  // `.call(drag)` is idempotent on the same element.
+  useEffect(() => {
+    if (!svgRef.current || !dragBehaviorRef.current) return
+    d3.select(svgRef.current)
+      .selectAll<SVGGElement, unknown>('g.entity-group')
+      .call(dragBehaviorRef.current)
+  }, [entityLabelsKey])
+
+  // --- Event-driven animations (moved from NetworkGraph) ---
+  //
+  // Each heartbeat/action/state log line in `events` fires a transient d3
+  // animation anchored at the triggering entity's pixel position. The effects
+  // live in their own <g> layer underneath the entities so they never block
+  // drag/click interactions. We track `lastEventCount` so re-renders don't
+  // replay old animations — only genuinely new entries animate.
+
+  // Stable map label → current pixel position, read via ref so the event
+  // effect doesn't need to re-run on every position tick.
+  const entityPxPos = useMemo(() => {
+    const map: Record<string, { x: number; y: number }> = {}
+    for (const e of entities) {
+      const p = effectivePos[e.label]
+      if (p) map[e.label] = { x: toPxX(p.x), y: toPxY(p.y) }
+    }
+    return map
+  }, [entities, effectivePos])
+  const entityPxPosRef = useRef(entityPxPos)
+  useEffect(() => {
+    entityPxPosRef.current = entityPxPos
+  }, [entityPxPos])
+
+  // Liveness lookup used to tint pulses green for running nodes and grey for
+  // stopped ones — read via ref for the same reason.
+  const livenessByLabel = useMemo(() => {
+    const map: Record<string, 'online' | 'offline'> = {}
+    for (const n of nodes) {
+      if (n.status === 'stopped') { map[n.label] = 'offline'; continue }
+      const hasAgent = states.some(s => s.label === n.label)
+      map[n.label] = hasAgent ? 'online' : 'offline'
+    }
+    return map
+  }, [nodes, states])
+  const livenessRef = useRef(livenessByLabel)
+  useEffect(() => {
+    livenessRef.current = livenessByLabel
+  }, [livenessByLabel])
+
+  const lastEventCount = useRef(0)
+  useEffect(() => {
+    if (events.length <= lastEventCount.current) {
+      lastEventCount.current = events.length
+      return
+    }
+    const newEvents = events.slice(lastEventCount.current)
+    lastEventCount.current = events.length
+
+    const layer = effectsLayerRef.current
+    if (!layer) return
+    const layerSel = d3.select(layer)
+    const positions = entityPxPosRef.current
+    const liveness = livenessRef.current
+
+    for (const ev of newEvents) {
+      const from = positions[ev.label]
+      if (!from) continue
+
+      if (ev.tag === 'HEARTBEAT' || ev.tag === 'HANDSHAKE' || ev.tag === 'DISCOVERY') {
+        const color = liveness[ev.label] === 'online' ? '#22c55e' : '#6b7280'
+        layerSel
+          .append('circle')
+          .attr('cx', from.x)
+          .attr('cy', from.y)
+          .attr('r', 14)
+          .attr('fill', 'none')
+          .attr('stroke', color)
+          .attr('stroke-width', 2)
+          .attr('opacity', 0.7)
+          .transition()
+          .duration(600)
+          .ease(d3.easeQuadOut)
+          .attr('r', 32)
+          .attr('opacity', 0)
+          .remove()
+      }
+
+      if (ev.tag === 'ACTION') {
+        const color = '#f97316'
+
+        // Flash ring at the source entity.
+        layerSel
+          .append('circle')
+          .attr('cx', from.x)
+          .attr('cy', from.y)
+          .attr('r', 18)
+          .attr('fill', 'none')
+          .attr('stroke', color)
+          .attr('stroke-width', 4)
+          .attr('opacity', 1)
+          .transition()
+          .duration(800)
+          .ease(d3.easeExpOut)
+          .attr('r', 52)
+          .attr('stroke-width', 1)
+          .attr('opacity', 0)
+          .remove()
+
+        // Bolts + trails flying to every other entity.
+        for (const [otherLabel, to] of Object.entries(positions)) {
+          if (otherLabel === ev.label) continue
+          const bolt = layerSel
+            .append('circle')
+            .attr('r', 4)
+            .attr('fill', color)
+            .attr('opacity', 0.9)
+            .attr('cx', from.x)
+            .attr('cy', from.y)
+          const trail = layerSel
+            .append('line')
+            .attr('x1', from.x)
+            .attr('y1', from.y)
+            .attr('x2', from.x)
+            .attr('y2', from.y)
+            .attr('stroke', color)
+            .attr('stroke-width', 2)
+            .attr('opacity', 0.6)
+
+          bolt
+            .transition()
+            .duration(500)
+            .ease(d3.easeCubicIn)
+            .attr('cx', to.x)
+            .attr('cy', to.y)
+            .attr('r', 3)
+            .on('end', function () {
+              d3.select(this).transition().duration(300).attr('opacity', 0).remove()
+            })
+
+          trail
+            .transition()
+            .duration(500)
+            .ease(d3.easeCubicIn)
+            .attr('x2', to.x)
+            .attr('y2', to.y)
+            .transition()
+            .duration(400)
+            .attr('opacity', 0)
+            .remove()
+        }
+      }
+
+      if (ev.tag === 'STATE') {
+        const color = '#f59e0b'
+        layerSel
+          .append('circle')
+          .attr('cx', from.x)
+          .attr('cy', from.y)
+          .attr('r', 42)
+          .attr('fill', 'none')
+          .attr('stroke', color)
+          .attr('stroke-width', 3)
+          .attr('opacity', 0.8)
+          .transition()
+          .duration(500)
+          .ease(d3.easeCubicOut)
+          .attr('r', 18)
+          .attr('opacity', 0)
+          .remove()
+      }
+    }
+  }, [events])
 
   const gradientId = `game-field-gradient-${activeGameId ?? 'none'}`
+
+  // Look up the active game config for game-specific UI (timer, flag holder).
+  const activeGame = useMemo<GameConfig | undefined>(() => {
+    if (!activeGameId) return undefined
+    return games.find(g => g.id === activeGameId)
+  }, [games, activeGameId])
 
   return (
     <Card>
@@ -257,8 +489,12 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
             ) : (
               <Badge variant="outline">no game loaded</Badge>
             )}
+            {/* CTF-style flag-holder pill — also works for any game whose
+                rules stamp `flag.holding_team`. */}
+            <FlagHolderBadge snapshots={snapshots} />
           </CardTitle>
           <div className="flex items-center gap-3">
+            <GameTimer snapshots={snapshots} durationS={activeGame?.duration_s} />
             <Scoreboard snapshots={snapshots} />
             <div className="text-xs text-muted-foreground">
               {FIELD_WIDTH_M}m × {FIELD_HEIGHT_M}m · radius {commRadiusM}m · {entities.length}{' '}
@@ -266,6 +502,7 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
             </div>
           </div>
         </div>
+        <EndedBanner snapshots={snapshots} />
       </CardHeader>
       <CardContent className="overflow-x-auto">
         <div className="relative inline-block" style={{ maxWidth: '100%' }}>
@@ -337,27 +574,60 @@ export function GameView({ nodes, snapshots, onMove, partitions }: GameViewProps
             })}
           </g>
 
-          {/* Comm edges */}
+          {/* Comm edges — one line per pair. Connected pairs are green; every
+              other pair (out of range, obstructed, or user-severed) renders as
+              a red dashed line with higher opacity. A wider transparent line
+              sits on top so the edge is easy to click. */}
           <g className="comm-edges">
             {commEdges.map(edge => {
               const pa = effectivePos[edge.a]
               const pb = effectivePos[edge.b]
               if (!pa || !pb) return null
+              const x1 = toPxX(pa.x)
+              const y1 = toPxY(pa.y)
+              const x2 = toPxX(pb.x)
+              const y2 = toPxY(pb.y)
+              const stroke = edge.connected ? '#22c55e' : '#ef4444'
+              const strokeOpacity = edge.connected ? 0.55 : 0.85
+              const strokeWidth = edge.connected ? 1.4 : 2
               return (
-                <line
+                <g
                   key={`${edge.a}-${edge.b}`}
-                  x1={toPxX(pa.x)}
-                  y1={toPxY(pa.y)}
-                  x2={toPxX(pb.x)}
-                  y2={toPxY(pb.y)}
-                  stroke={edge.partitioned ? '#ef4444' : '#22c55e'}
-                  strokeOpacity={edge.partitioned ? 0.9 : 0.6}
-                  strokeWidth={edge.partitioned ? 2 : 1.2}
-                  strokeDasharray="6,4"
-                />
+                  className="comm-edge"
+                  style={{ cursor: 'pointer' }}
+                  onClick={() => onTogglePartition(edge.a, edge.b)}
+                >
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke={stroke}
+                    strokeOpacity={strokeOpacity}
+                    strokeWidth={strokeWidth}
+                    strokeDasharray="6,4"
+                  />
+                  {/* Invisible wider hit target — makes thin lines easy to
+                      tap without dominating the visual. `pointerEvents="stroke"`
+                      guarantees the line catches clicks even though the stroke
+                      is transparent. */}
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke="transparent"
+                    strokeWidth={14}
+                    pointerEvents="stroke"
+                  />
+                </g>
               )
             })}
           </g>
+
+          {/* Effects layer (heartbeat/action/state animations) sits above the
+              edges and behind the entities so pulses don't hide the glyphs. */}
+          <g ref={effectsLayerRef} className="effects-layer" pointerEvents="none" />
 
           {/* Entities */}
           <g className="entities">
@@ -417,17 +687,213 @@ function Scoreboard({
         <span
           key={team}
           className="font-mono text-xs font-semibold px-1.5 py-0.5 rounded"
+          title={`${team} hold time: ${formatMmSs(merged[team])}`}
           style={{
             backgroundColor: teamColor(team) + '22',
             color: teamColor(team),
             border: `1px solid ${teamColor(team)}55`,
           }}
         >
-          {team}: {merged[team]}
+          {team}: {formatMmSs(merged[team])}
         </span>
       ))}
     </div>
   )
+}
+
+// --- Game timer (MM:SS) ---
+//
+// The backend pins `countdown_zero_ns` to the consensus timestamp of the final
+// `ReadyUp`, then `CountingDown → Playing` flips 3s later. Gameplay therefore
+// starts at `countdown_zero_ns + 3s` on every node, so we can derive an
+// MM:SS countdown purely from the snapshot stream. When `duration_s` is unset
+// we render an elapsed-since-start timer instead so every game still surfaces
+// a running clock.
+function GameTimer({
+  snapshots,
+  durationS,
+}: {
+  snapshots: Record<string, LocalGameSnapshot>
+  durationS?: number
+}) {
+  const [now, setNow] = useState(() => Date.now())
+
+  const phases = useMemo(() => Object.values(snapshots).map(s => s.phase), [snapshots])
+  const anyPlaying = phases.some(p => p === 'playing')
+  const anyEnded = phases.some(p => p === 'ended')
+  const live = anyPlaying || anyEnded
+  useEffect(() => {
+    if (!live) return
+    const id = window.setInterval(() => setNow(Date.now()), 250)
+    return () => window.clearInterval(id)
+  }, [live])
+
+  // countdown_zero_ns is nanoseconds since UNIX epoch. Play starts 3s later.
+  const startMs = useMemo(() => {
+    for (const snap of Object.values(snapshots)) {
+      if (snap.countdown_zero_ns != null) {
+        const zeroMs = Math.floor(snap.countdown_zero_ns / 1_000_000)
+        return zeroMs + 3_000
+      }
+    }
+    return null
+  }, [snapshots])
+
+  if (!live || startMs == null) return null
+
+  const elapsedMs = Math.max(0, now - startMs)
+  if (durationS != null) {
+    const remainingMs = Math.max(0, durationS * 1000 - elapsedMs)
+    const critical = remainingMs <= 30_000
+    const color = anyEnded
+      ? 'text-purple-300 border-purple-400/40 bg-purple-500/10'
+      : critical
+        ? 'text-amber-300 border-amber-400/50 bg-amber-500/10'
+        : 'text-emerald-300 border-emerald-400/40 bg-emerald-500/10'
+    return (
+      <span
+        className={`font-mono text-xs font-semibold px-2 py-0.5 rounded border ${color} ${critical && !anyEnded ? 'animate-pulse' : ''}`}
+        title={
+          anyEnded
+            ? 'Game ended'
+            : `Time remaining · game ends at ${new Date(startMs + durationS * 1000).toLocaleTimeString()}`
+        }
+      >
+        ⏱ {formatMmSs(Math.ceil(remainingMs / 1000))}
+      </span>
+    )
+  }
+
+  // No duration configured — show elapsed as a neutral pill.
+  return (
+    <span
+      className="font-mono text-xs font-semibold px-2 py-0.5 rounded border border-slate-500/40 bg-slate-500/10 text-slate-200"
+      title="Elapsed play time"
+    >
+      ⏱ {formatMmSs(Math.floor(elapsedMs / 1000))}
+    </span>
+  )
+}
+
+// --- Flag-holder pill ---
+//
+// Reads `entities.<flag>.properties.holding_team` from any converged snapshot.
+// The CTF `mark_holding` rule stamps it once the flag has sat at a base for
+// 1s; it persists as "last holder" until another base takes possession. We
+// also cross-check the proximity_tracker to label "currently at base" vs
+// "last held by" so the UI tells the truth when the flag is in transit.
+function FlagHolderBadge({
+  snapshots,
+}: {
+  snapshots: Record<string, LocalGameSnapshot>
+}) {
+  const snap = Object.values(snapshots).find(s => s.active_game_id) ?? null
+  if (!snap) return null
+
+  // Find the flag entity (game-agnostic — any entity whose type is 'flag').
+  const flagEntity = Object.values(snap.entities).find(e => e.entity_type === 'flag')
+  if (!flagEntity) return null
+
+  const holdingTeam = (flagEntity.properties?.holding_team as string | undefined) ?? null
+
+  // Is the flag currently within 1m of *a* base? We can tell from the
+  // proximity_tracker — `mark_holding`'s rule-scoped key is `mark_holding|<flag>|<base>`
+  // and is present iff the pair is currently within range.
+  const tracker = snap.proximity_tracker ?? {}
+  const flagLabel = flagEntity.label
+  const activelyHeld = Object.keys(tracker).some(key => {
+    if (!key.startsWith('mark_holding|')) return false
+    return key.includes(`|${flagLabel}|`) || key.endsWith(`|${flagLabel}`)
+  })
+
+  if (!holdingTeam && !activelyHeld) {
+    return (
+      <Badge
+        variant="outline"
+        className="text-[10px] font-mono border-slate-500/40 bg-slate-500/10 text-slate-200"
+        title="Flag has not been captured yet"
+      >
+        🚩 neutral
+      </Badge>
+    )
+  }
+
+  const color = holdingTeam ? teamColor(holdingTeam) : '#94a3b8'
+  return (
+    <Badge
+      variant="outline"
+      className="text-[10px] font-mono"
+      style={{
+        backgroundColor: color + '22',
+        color,
+        borderColor: color + '55',
+      }}
+      title={
+        activelyHeld
+          ? `Flag is at ${holdingTeam ?? 'a'} base`
+          : `Flag last captured by ${holdingTeam ?? 'unknown'}; currently in transit`
+      }
+    >
+      🚩 {activelyHeld ? `at ${holdingTeam ?? '?'} base` : `last held by ${holdingTeam ?? '?'}`}
+    </Badge>
+  )
+}
+
+// --- Ended banner (winner + reason) ---
+//
+// When any node's phase flips to `ended`, surface the winner_team and reason
+// captured from the GameEnd payload. Renders below the header row so the
+// playing field stays unobstructed.
+function EndedBanner({
+  snapshots,
+}: {
+  snapshots: Record<string, LocalGameSnapshot>
+}) {
+  const ended = useMemo(() => {
+    for (const snap of Object.values(snapshots)) {
+      if (snap.phase !== 'ended') continue
+      return {
+        winner: snap.ended_winner_team ?? null,
+        reason: snap.ended_reason ?? null,
+      }
+    }
+    return null
+  }, [snapshots])
+
+  if (!ended) return null
+
+  return (
+    <div className="mt-2 flex items-center gap-2 text-xs rounded border border-purple-500/40 bg-purple-500/10 text-purple-200 px-2 py-1">
+      <span className="font-semibold uppercase tracking-wide">Game ended</span>
+      {ended.winner ? (
+        <span
+          className="px-1.5 py-0.5 rounded font-mono font-semibold"
+          style={{
+            backgroundColor: teamColor(ended.winner) + '22',
+            color: teamColor(ended.winner),
+            border: `1px solid ${teamColor(ended.winner)}55`,
+          }}
+        >
+          winner: {ended.winner}
+        </span>
+      ) : (
+        <span className="px-1.5 py-0.5 rounded font-mono font-semibold bg-slate-500/20 text-slate-200 border border-slate-500/40">
+          draw
+        </span>
+      )}
+      {ended.reason && <span className="text-[11px] italic truncate">{ended.reason}</span>}
+    </div>
+  )
+}
+
+/** Format a non-negative number of seconds as `MM:SS`. */
+function formatMmSs(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds))
+  const mm = Math.floor(s / 60)
+    .toString()
+    .padStart(2, '0')
+  const ss = (s % 60).toString().padStart(2, '0')
+  return `${mm}:${ss}`
 }
 
 // --- Synchronised 3-2-1-GO countdown overlay ---

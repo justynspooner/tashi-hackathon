@@ -992,8 +992,25 @@ fn handle_vertex_message(
             }
         }
         MessageKind::GameEnd => {
+            // Preserve winner/reason from the payload so the UI can surface
+            // the outcome in the Ended state. First arrival wins — later
+            // GameEnd broadcasts (e.g. from multiple nodes racing the time
+            // limit) don't overwrite.
+            if let Some(GamePayload::GameEnd { winner_team, reason }) = &wire.game {
+                if state.game_state.ended_reason.is_none() {
+                    state.game_state.ended_winner_team = winner_team.clone();
+                    state.game_state.ended_reason = Some(reason.clone());
+                }
+            }
             state.game_state.phase = GamePhase::Ended;
-            log("GAME_EVENT", &state.label, format!("game_end from {peer_short}"));
+            log(
+                "GAME_EVENT",
+                &state.label,
+                format!(
+                    "game_end from {peer_short}: winner={:?} reason={:?}",
+                    state.game_state.ended_winner_team, state.game_state.ended_reason
+                ),
+            );
             game_changed = true;
         }
     }

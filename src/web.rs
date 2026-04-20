@@ -117,6 +117,12 @@ struct AppState {
     proof_counts: Mutex<HashMap<String, usize>>,
     /// Packet filter manager for network partition simulation.
     pf: PfPartitionManager,
+    /// User-severed links that override the range-based reconciler. Stored as
+    /// sorted label pairs `(lo, hi)`. The reconciler unions this set into the
+    /// desired blocked set every tick, so a manual sever survives regardless
+    /// of how close the two nodes are on the field. Cleared only by the user
+    /// tapping the edge again (via the `/api/partitions/heal` endpoint).
+    manual_partitions: Mutex<HashSet<(String, String)>>,
     /// Latest per-node game-state snapshot (the content of `{label}-game.json`),
     /// refreshed by the file watcher. Keyed by label.
     game_snapshots: Mutex<HashMap<String, serde_json::Value>>,
@@ -160,6 +166,7 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         log_offsets: Mutex::new(HashMap::new()),
         proof_counts: Mutex::new(HashMap::new()),
         pf: PfPartitionManager::new(),
+        manual_partitions: Mutex::new(HashSet::new()),
         game_snapshots: Mutex::new(HashMap::new()),
         game_file_mtimes: Mutex::new(HashMap::new()),
         games: GamesState { dir: games_dir, configs: game_configs },
@@ -590,6 +597,47 @@ fn compute_desired_blocked(
     desired
 }
 
+/// Run one reconciliation pass: compute the desired blocked port set from
+/// (range-based + hysteresis) ∪ (user manual partitions) and push it through
+/// `pf.set_blocked`. Returns the diff when anything changed, or `None` on
+/// no-op.
+///
+/// Called both from the periodic reconciler loop and synchronously from the
+/// `create_partition`/`heal_partition` endpoints so user clicks take effect
+/// immediately without waiting for the next tick.
+async fn reconcile_once(
+    state: &Arc<AppState>,
+    radius_m: f32,
+) -> anyhow::Result<Option<(Vec<PortPair>, Vec<PortPair>)>> {
+    let positions = snapshot_positions(state);
+    if positions.len() < 2 {
+        // Nothing meaningful to reconcile, but still honor manual severances
+        // if both endpoints happen to be configured (edge case).
+    }
+
+    let current_blocked_ports = state.pf.blocked_pairs();
+    let ports = label_port_map(state);
+    let port_to_label: HashMap<u16, String> =
+        ports.iter().map(|(l, p)| (*p, l.clone())).collect();
+
+    let currently_blocked_labels =
+        blocked_ports_to_labels(&current_blocked_ports, &port_to_label);
+
+    let mut desired_blocked =
+        compute_desired_blocked(&positions, &ports, &currently_blocked_labels, radius_m);
+
+    // Overlay: user-severed label pairs always block regardless of range.
+    {
+        let manual = state.manual_partitions.lock().unwrap();
+        for (la, lb) in manual.iter() {
+            let (Some(&pa), Some(&pb)) = (ports.get(la), ports.get(lb)) else { continue };
+            desired_blocked.insert(normalize_pair(pa, pb));
+        }
+    }
+
+    state.pf.set_blocked(desired_blocked).await
+}
+
 async fn partition_reconciler(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(RECONCILER_TICK_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -602,23 +650,7 @@ async fn partition_reconciler(state: Arc<AppState>) {
     loop {
         interval.tick().await;
 
-        let positions = snapshot_positions(&state);
-        if positions.len() < 2 {
-            continue;
-        }
-
-        let current_blocked_ports = state.pf.blocked_pairs();
-        let ports = label_port_map(&state);
-        let port_to_label: HashMap<u16, String> =
-            ports.iter().map(|(l, p)| (*p, l.clone())).collect();
-
-        let currently_blocked_labels =
-            blocked_ports_to_labels(&current_blocked_ports, &port_to_label);
-
-        let desired_blocked =
-            compute_desired_blocked(&positions, &ports, &currently_blocked_labels, radius_m);
-
-        match state.pf.set_blocked(desired_blocked).await {
+        match reconcile_once(&state, radius_m).await {
             Ok(Some((added, removed))) => {
                 if !added.is_empty() || !removed.is_empty() {
                     println!(
@@ -628,10 +660,10 @@ async fn partition_reconciler(state: Arc<AppState>) {
                         state.pf.blocked_pairs().len()
                     );
                     let partitions = partition_list(&state);
-                    // Emit the generic `partition_changed` for the network
-                    // graph to refetch, and an auto-tagged `partition_auto`
-                    // so the consensus-stalled banner can tell that this
-                    // change was reconciler-driven (vs a human click).
+                    // Emit the generic `partition_changed` for any edge-list
+                    // consumers, and an auto-tagged `partition_auto` so the
+                    // consensus-stalled banner can tell that this change was
+                    // reconciler-driven (vs a human click).
                     let _ = state.sse_tx.send(
                         serde_json::json!({"type": "partition_changed", "partitions": partitions})
                             .to_string(),
@@ -771,7 +803,18 @@ async fn get_state(State(state): State<Arc<AppState>>) -> Json<Vec<AgentStateRes
 }
 
 async fn get_proofs(State(state): State<Arc<AppState>>) -> Json<Vec<ProofResponse>> {
-    Json(state.proofs.lock().unwrap().clone())
+    // Cap the response to the most recent proofs. The full set is retained
+    // in-memory (for `/verify`) and on disk, but the frontend refetches this
+    // endpoint on every SSE `update`, and rendering an uncapped list (with
+    // no virtualisation) grows the renderer's heap until Chrome terminates
+    // the tab. 200 is comfortably above what the UI shows at once.
+    const MAX_PROOFS_RETURNED: usize = 200;
+    let proofs = state.proofs.lock().unwrap();
+    let mut sorted: Vec<ProofResponse> = proofs.iter().cloned().collect();
+    drop(proofs);
+    sorted.sort_by(|a, b| b.proof.consensus_at.cmp(&a.proof.consensus_at));
+    sorted.truncate(MAX_PROOFS_RETURNED);
+    Json(sorted)
 }
 
 #[derive(Deserialize)]
@@ -1266,6 +1309,7 @@ async fn destroy_swarm(
     state.proof_counts.lock().unwrap().clear();
     state.game_snapshots.lock().unwrap().clear();
     state.game_file_mtimes.lock().unwrap().clear();
+    state.manual_partitions.lock().unwrap().clear();
     println!("Swarm destroyed");
 
     let _ = state.sse_tx.send(
@@ -1308,19 +1352,39 @@ async fn get_partitions(
     Json(serde_json::json!({ "partitions": partition_list(&state) }))
 }
 
+/// Normalize a pair of labels into a stable `(lo, hi)` tuple so the
+/// `manual_partitions` set is insensitive to input order.
+fn normalize_label_pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
 async fn create_partition(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PartitionRequest>,
 ) -> Json<serde_json::Value> {
-    let (port_a, port_b) = {
+    // Validate the labels before touching state so bad input is a no-op.
+    {
         let config = state.config.lock().unwrap();
-        match (label_to_port(&config, &body.node_a), label_to_port(&config, &body.node_b)) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Json(serde_json::json!({"error": "unknown node label"})),
+        if label_to_port(&config, &body.node_a).is_none()
+            || label_to_port(&config, &body.node_b).is_none()
+        {
+            return Json(serde_json::json!({"error": "unknown node label"}));
         }
-    };
+    }
 
-    if let Err(e) = state.pf.partition(port_a, port_b).await {
+    // Record the sever in the manual overlay — the reconciler will pick it
+    // up and keep the pair blocked even when the range-based check would
+    // otherwise allow them to talk.
+    {
+        let mut manual = state.manual_partitions.lock().unwrap();
+        manual.insert(normalize_label_pair(&body.node_a, &body.node_b));
+    }
+
+    if let Err(e) = reconcile_once(&state, COMM_RADIUS_M).await {
         return Json(serde_json::json!({"error": e.to_string()}));
     }
 
@@ -1336,15 +1400,24 @@ async fn heal_partition(
     State(state): State<Arc<AppState>>,
     Json(body): Json<PartitionRequest>,
 ) -> Json<serde_json::Value> {
-    let (port_a, port_b) = {
+    {
         let config = state.config.lock().unwrap();
-        match (label_to_port(&config, &body.node_a), label_to_port(&config, &body.node_b)) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Json(serde_json::json!({"error": "unknown node label"})),
+        if label_to_port(&config, &body.node_a).is_none()
+            || label_to_port(&config, &body.node_b).is_none()
+        {
+            return Json(serde_json::json!({"error": "unknown node label"}));
         }
-    };
+    }
 
-    if let Err(e) = state.pf.heal(port_a, port_b).await {
+    // Clear the manual overlay. The reconciler decides what to do on the next
+    // pass: if the pair is still out of range it stays blocked (auto), else
+    // it unblocks.
+    {
+        let mut manual = state.manual_partitions.lock().unwrap();
+        manual.remove(&normalize_label_pair(&body.node_a, &body.node_b));
+    }
+
+    if let Err(e) = reconcile_once(&state, COMM_RADIUS_M).await {
         return Json(serde_json::json!({"error": e.to_string()}));
     }
 
@@ -1387,6 +1460,7 @@ async fn clear_artifacts(
     state.proof_counts.lock().unwrap().clear();
     state.game_snapshots.lock().unwrap().clear();
     state.game_file_mtimes.lock().unwrap().clear();
+    state.manual_partitions.lock().unwrap().clear();
     let _ = state.sse_tx.send(
         serde_json::json!({"type": "artifacts_cleared", "ts": now_ms()}).to_string(),
     );

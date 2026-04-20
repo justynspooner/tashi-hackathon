@@ -90,6 +90,16 @@ pub struct LocalGameState {
     pub placement_ok: bool,
     #[serde(default)]
     pub ready_peers: Vec<String>,
+    /// Winning team recorded from the `GameEnd` payload when the game
+    /// transitioned to `Ended`. `None` means either the game hasn't ended or
+    /// ended in a draw. Kept distinct from `scores` so the UI can surface the
+    /// decided outcome even after scores drift post-end.
+    #[serde(default)]
+    pub ended_winner_team: Option<String>,
+    /// Human-readable reason captured alongside `GameEnd` (e.g. "10-minute
+    /// time limit reached"). Consumed by the frontend's Ended banner.
+    #[serde(default)]
+    pub ended_reason: Option<String>,
 }
 
 impl LocalGameState {
@@ -119,6 +129,8 @@ impl LocalGameState {
             countdown_zero_ns: None,
             placement_ok: false,
             ready_peers: Vec::new(),
+            ended_winner_team: None,
+            ended_reason: None,
         }
     }
 

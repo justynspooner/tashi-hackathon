@@ -2,6 +2,7 @@
   "id": "ctf",
   "name": "Capture the Flag",
   "teams": ["red", "blue"],
+  "duration_s": 600,
   "entity_types": [
     { "id": "flag",   "min": 1, "max": 1, "team": null,       "visual": "flag" },
     { "id": "base",   "min": 1, "max": 1, "team": "per_team", "visual": "base" },
@@ -13,25 +14,41 @@
   ],
   "rules": [
     {
-      "id": "flag_capture",
-      "on": "sensor_reading",
+      "//": "Mark who currently holds the flag — fires on the base whose node sees the flag within 1m for 1s, sets flag.holding_team. The value only changes when a different team brings the flag home, so the delta handler treats repeated re-applies as no-ops (UI-stable).",
+      "id": "mark_holding",
+      "on": "tick",
       "when": { "kind": "all", "of": [
-        { "kind": "entity_is", "entity_type": "player" },
-        { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 10 }
+        { "kind": "entity_is", "entity_type": "base" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 1 }
       ] },
-      "effect": { "kind": "set_property", "target_entity_type": "flag", "key": "owner_team", "value": "self.team" }
+      "effect": { "kind": "set_property", "target_entity_type": "flag", "key": "holding_team", "value": "self.team" }
     },
     {
-      "id": "score_capture",
+      "//": "Hold-time pulse — fires on the base every tick the flag is within 1m, writing a fresh now_ms into flag.hold_pulse_ms. Because the value changes every tick the delta-side property_changed predicate below fires once per second, so each node increments the holding team's score in lockstep.",
+      "id": "hold_pulse",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "base" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 1 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "flag", "key": "hold_pulse_ms", "value": "now_ms" }
+    },
+    {
+      "//": "Hold-time scoring — runs on every node once the hold_pulse delta lands, so the score[team] counter (≈ seconds of possession) converges through consensus instead of diverging per-tick like a raw tick rule would.",
+      "id": "hold_score",
       "on": "game_state_delta",
-      "when": { "kind": "property_changed", "target_entity_type": "flag", "key": "owner_team" },
+      "when": { "kind": "property_changed", "target_entity_type": "flag", "key": "hold_pulse_ms" },
       "effect": { "kind": "increment_score", "team": "self.team", "by": 1 }
     },
     {
-      "id": "capture_wins",
-      "on": "game_state_delta",
-      "when": { "kind": "property_changed", "target_entity_type": "flag", "key": "owner_team" },
-      "effect": { "kind": "end_game", "winner_team": "self.team", "reason": "first flag capture" }
+      "//": "Hard time limit — only the flag's node fires (entity_is: flag) so exactly one GameEnd broadcasts, carrying the winner derived from the flag node's view of scores. winner_team: highest_score picks the strictly-top team and resolves ties to null (rendered as 'draw').",
+      "id": "time_limit",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "flag" },
+        { "kind": "game_time_elapsed_s", "min_s": 600 }
+      ] },
+      "effect": { "kind": "end_game", "winner_team": "highest_score", "reason": "10-minute time limit reached" }
     }
   ]
 }

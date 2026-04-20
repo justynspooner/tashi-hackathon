@@ -48,11 +48,21 @@ describe('ctf.json', () => {
     expect(cfg.placement.length).toBe(2)
   })
 
-  test('declares flag_capture, score_capture, and capture_wins rules', () => {
-    // capture_wins exercises the `end_game` effect (Phase-E completeness)
-    // so the DSL's full effect surface ships in at least one game.
+  test('declares mark_holding, hold_pulse, hold_score, and time_limit rules', () => {
+    // 10-minute hold-the-flag scoring:
+    //   - mark_holding stamps flag.holding_team for the UI pill,
+    //   - hold_pulse writes now_ms to flag.hold_pulse_ms every tick the flag
+    //     sits in a base, so the delta side
+    //   - hold_score can increment the holding team's score in lockstep on
+    //     every node,
+    //   - time_limit ends the game after duration_s with the highest-score
+    //     team as winner.
     const ids = cfg.rules.map(r => r.id).sort()
-    expect(ids).toEqual(['capture_wins', 'flag_capture', 'score_capture'])
+    expect(ids).toEqual(['hold_pulse', 'hold_score', 'mark_holding', 'time_limit'])
+  })
+
+  test('declares a duration_s time limit', () => {
+    expect(cfg.duration_s).toBe(600)
   })
 })
 

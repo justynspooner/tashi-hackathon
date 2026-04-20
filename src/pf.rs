@@ -129,25 +129,6 @@ impl PfPartitionManager {
         Ok(())
     }
 
-    /// Block traffic between two ports.
-    pub async fn partition(&self, port_a: u16, port_b: u16) -> anyhow::Result<()> {
-        self.ensure_setup().await?;
-        let pair = normalize_pair(port_a, port_b);
-        self.blocked.lock().unwrap().insert(pair);
-        self.reload_rules().await?;
-        println!("Partitioned ports {} <-> {}", port_a, port_b);
-        Ok(())
-    }
-
-    /// Restore traffic between two ports.
-    pub async fn heal(&self, port_a: u16, port_b: u16) -> anyhow::Result<()> {
-        let pair = normalize_pair(port_a, port_b);
-        self.blocked.lock().unwrap().remove(&pair);
-        self.reload_rules().await?;
-        println!("Healed ports {} <-> {}", port_a, port_b);
-        Ok(())
-    }
-
     /// Atomically replace the blocked-pair set and reload the ruleset in a
     /// single `pfctl -f` call. Returns `Ok(None)` if no change was needed, or
     /// `Ok(Some((added, removed)))` describing the diff that was applied.
