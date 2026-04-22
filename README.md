@@ -1,8 +1,23 @@
 # Tashi Vertex Explorer
 
-A live coordination explorer built on the [Tashi Vertex](https://github.com/tashigit/tashi-vertex-rs) BFT consensus engine.
+> 🏆 **Submission: [Vertex Swarm Challenge 2026](https://dorahacks.io/hackathon/global-vertex-swarm-challenge/tracks#-track-1-ghost-in-the-machine-open-track-) — Track 1: 👻 Ghost in the Machine (Open Track)**
 
-A swarm of nodes performs signed handshakes, replicates game state, detects partitions, recovers automatically, and produces cryptographic proofs of coordination — all visible in real time through a browser dashboard. Three ready-to-play multiplayer games (Capture the Flag, King of the Hill, Territory Control) ride on top of the same consensus stream.
+## The Pitch: Refereeless Physical Games, Powered by a P2P Swarm
+
+**The novel use case:** turn a handful of phones, wearables, or IoT tags into a self-refereeing swarm for **competitive and casual physical gaming** — Capture the Flag in the park, King of the Hill at a company offsite, Territory Control at a schoolyard — with zero servers, zero accounts, and zero trust in any single player's device.
+
+Each device is a full Vertex peer carrying **the rulebook for every supported game**. At match time, players **propose and vote a game via BFT consensus** (30-second window, majority rule). The winning rulebook loads in lockstep on every device, entities are claimed through consensus (no duplicate flags, no stacked teams), and play begins from the Vertex-agreed timestamp of the final ready-up — **zero clock skew**, zero "my phone said I tagged you first" arguments.
+
+### Why this is a great fit for Track 1
+
+| Judging criterion | How we hit it |
+| --- | --- |
+| **Innovation & Novelty** | Physical sports as a decentralized multi-agent problem. Every player's device is a heterogeneous peer (different hardware, different sensors, different network paths) voting on shared reality. Runtime-voted rulesets mean **one install, many games**. |
+| **Decentralized Logic** | No central referee, no cloud broker. The pure-function rules engine runs identically on every node and is driven only by the consensus event stream, so all peers converge on the same scoring, tagging, and violation decisions. Game selection itself is a BFT vote. |
+| **Robustness** | A real `pfctl`-driven partition manager plus a 500 ms range-based reconciler demonstrate **continued play during partial network loss**. Drag a player outside the 15 m comm radius and watch the Finality Chart flatten, then rejoin and see state reconcile — no cloud required for any of it. |
+| **Developer Clarity** | Single-command backend (`cargo run -- serve`), single-command frontend (`bun run dev`), and a canvas-centric dashboard that visualizes every handshake, vote, rule firing, and partition in real time. Every consensus event is saved as a verifiable JSON proof. |
+
+**TL;DR:** it's a field-ready referee swarm. Bring the players, vote the game, play fair — even when the Wi-Fi dies.
 
 ---
 
