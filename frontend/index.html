@@ -6,6 +6,24 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Tashi Vertex Explorer</title>
+  <!-- Pre-hydration theme script: resolve stored preference before React mounts
+       so users who prefer dark don't flash the light palette on first paint. -->
+  <script>
+    (function () {
+      try {
+        var stored = localStorage.getItem('tashi-theme') || 'system'
+        var prefersDark = window.matchMedia &&
+          window.matchMedia('(prefers-color-scheme: dark)').matches
+        var resolved = stored === 'system'
+          ? (prefersDark ? 'dark' : 'light')
+          : stored
+        document.documentElement.classList.add(resolved)
+        document.documentElement.style.colorScheme = resolved
+      } catch (_) {
+        /* localStorage/matchMedia unavailable — fall back to light via CSS :root */
+      }
+    })()
+  </script>
 </head>
 
 <body>

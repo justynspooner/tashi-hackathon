@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { AgentState, EventLogEntry, NodeInfo, ProofOfCoordination } from '../types'
+import { errorToast, infoToast } from './useErrorToast'
 
 const MAX_LOG_ENTRIES = 5000
 const EVENT_LOG_STORAGE_KEY = 'vertex-event-log'
@@ -175,27 +176,55 @@ export function useNodes() {
   }, [])
 
   const startNode = useCallback(async (label: string) => {
-    await fetch(`/api/nodes/${label}/start`, { method: 'POST' })
-    await fetchNodes()
+    try {
+      const res = await fetch(`/api/nodes/${label}/start`, { method: 'POST' })
+      if (!res.ok) throw new Error(`start failed: ${res.status}`)
+    } catch (err) {
+      errorToast(`Start ${label} failed`, err)
+      throw err
+    } finally {
+      await fetchNodes()
+    }
   }, [fetchNodes])
 
   const stopNode = useCallback(async (label: string) => {
-    await fetch(`/api/nodes/${label}/stop`, { method: 'POST' })
-    await fetchNodes()
+    try {
+      const res = await fetch(`/api/nodes/${label}/stop`, { method: 'POST' })
+      if (!res.ok) throw new Error(`stop failed: ${res.status}`)
+    } catch (err) {
+      errorToast(`Stop ${label} failed`, err)
+      throw err
+    } finally {
+      await fetchNodes()
+    }
   }, [fetchNodes])
 
   const createSwarm = useCallback(async (count: number) => {
-    await fetch('/api/swarm', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ count }),
-    })
-    await fetchNodes()
+    try {
+      const res = await fetch('/api/swarm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count }),
+      })
+      if (!res.ok) throw new Error(`create swarm failed: ${res.status}`)
+    } catch (err) {
+      errorToast('Deploy swarm failed', err)
+      throw err
+    } finally {
+      await fetchNodes()
+    }
   }, [fetchNodes])
 
   const destroySwarm = useCallback(async () => {
-    await fetch('/api/swarm', { method: 'DELETE' })
-    await fetchNodes()
+    try {
+      const res = await fetch('/api/swarm', { method: 'DELETE' })
+      if (!res.ok) throw new Error(`destroy failed: ${res.status}`)
+    } catch (err) {
+      errorToast('Destroy swarm failed', err)
+      throw err
+    } finally {
+      await fetchNodes()
+    }
   }, [fetchNodes])
 
   return { nodes, startNode, stopNode, createSwarm, destroySwarm, refetch: fetchNodes }
@@ -236,8 +265,10 @@ export function usePartitions() {
       })
       const data = await res.json()
       console.log('[partition] response', res.status, data)
+      if (!res.ok) throw new Error(`partition toggle failed: ${res.status}`)
     } catch (err) {
       console.error('[partition] fetch error', err)
+      errorToast('Toggle partition failed', err)
     }
     await fetchPartitions()
   }, [partitions, fetchPartitions])
@@ -280,40 +311,89 @@ export function useSSE(callbacks?: {
     callbacksRef.current?.onPartitionChanged?.()
   }, 500)
 
-  useEffect(() => {
-    const source = new EventSource('/api/events')
+  // Exponential backoff state: attempt count resets to 0 when a `connected`
+  // message lands; retry delays step through 1s → 2s → 4s → 8s → 16s → 30s cap.
+  //
+  // Toast behaviour:
+  //   - everConnected=true AND disconnectToasted=false  → toast on disconnect
+  //   - everConnected=true AND disconnectToasted=true   → toast on reconnect
+  //   - everConnected=false                             → silent (initial boot)
+  const attemptRef = useRef(0)
+  const sourceRef = useRef<EventSource | null>(null)
+  const reconnectTimerRef = useRef<number | null>(null)
+  const everConnectedRef = useRef(false)
+  const disconnectToastedRef = useRef(false)
 
-    source.onmessage = (event) => {
-      const data = JSON.parse(event.data)
-      if (data.type === 'connected') {
-        setConnected(true)
-      } else if (data.type === 'event_log' && callbacksRef.current?.onEventLog) {
-        callbacksRef.current.onEventLog(data.entry)
-      } else if (data.type === 'update') {
-        throttledUpdate()
-      } else if (data.type === 'node_status' || data.type === 'node_added' || data.type === 'swarm_created' || data.type === 'swarm_destroyed') {
-        throttledNodeStatus()
-      } else if (data.type === 'partition_changed') {
-        throttledPartition()
-      } else if (data.type === 'partition_auto' && callbacksRef.current?.onPartitionAuto) {
-        callbacksRef.current.onPartitionAuto({
-          partitions: data.partitions ?? [],
-          radius_m: data.radius_m ?? 0,
-        })
-      } else if (data.type === 'game_state_changed' && callbacksRef.current?.onGameStateChanged) {
-        callbacksRef.current.onGameStateChanged(data.label, data.snapshot)
-      } else if (data.type === 'rule_violated' && callbacksRef.current?.onRuleViolated) {
-        callbacksRef.current.onRuleViolated({
-          label: data.label,
-          rule_id: data.rule_id,
-          reason: data.reason,
-        })
+  useEffect(() => {
+    let cancelled = false
+
+    const connect = () => {
+      if (cancelled) return
+      const source = new EventSource('/api/events')
+      sourceRef.current = source
+
+      source.onmessage = (event) => {
+        const data = JSON.parse(event.data)
+        if (data.type === 'connected') {
+          attemptRef.current = 0
+          setConnected(true)
+          if (disconnectToastedRef.current) {
+            infoToast('Reconnected to event stream')
+            disconnectToastedRef.current = false
+          }
+          everConnectedRef.current = true
+        } else if (data.type === 'event_log' && callbacksRef.current?.onEventLog) {
+          callbacksRef.current.onEventLog(data.entry)
+        } else if (data.type === 'update') {
+          throttledUpdate()
+        } else if (data.type === 'node_status' || data.type === 'node_added' || data.type === 'swarm_created' || data.type === 'swarm_destroyed') {
+          throttledNodeStatus()
+        } else if (data.type === 'partition_changed') {
+          throttledPartition()
+        } else if (data.type === 'partition_auto' && callbacksRef.current?.onPartitionAuto) {
+          callbacksRef.current.onPartitionAuto({
+            partitions: data.partitions ?? [],
+            radius_m: data.radius_m ?? 0,
+          })
+        } else if (data.type === 'game_state_changed' && callbacksRef.current?.onGameStateChanged) {
+          callbacksRef.current.onGameStateChanged(data.label, data.snapshot)
+        } else if (data.type === 'rule_violated' && callbacksRef.current?.onRuleViolated) {
+          callbacksRef.current.onRuleViolated({
+            label: data.label,
+            rule_id: data.rule_id,
+            reason: data.reason,
+          })
+        }
+      }
+
+      source.onerror = () => {
+        setConnected(false)
+        // Only toast a disconnect after we've ever been connected, and only
+        // once per disconnection episode.
+        if (everConnectedRef.current && !disconnectToastedRef.current) {
+          errorToast('Disconnected from event stream', 'Reconnecting with backoff…')
+          disconnectToastedRef.current = true
+        }
+        source.close()
+        if (sourceRef.current === source) sourceRef.current = null
+        if (cancelled) return
+        const delay = Math.min(30_000, 1_000 * Math.pow(2, attemptRef.current))
+        attemptRef.current += 1
+        reconnectTimerRef.current = window.setTimeout(connect, delay)
       }
     }
 
-    source.onerror = () => setConnected(false)
+    connect()
 
-    return () => source.close()
+    return () => {
+      cancelled = true
+      if (reconnectTimerRef.current != null) {
+        window.clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+      sourceRef.current?.close()
+      sourceRef.current = null
+    }
   }, [throttledUpdate, throttledNodeStatus, throttledPartition])
 
   return { connected }

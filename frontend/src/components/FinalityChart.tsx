@@ -1,6 +1,5 @@
 import { memo, useMemo } from 'react'
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from 'recharts'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   ChartContainer,
   ChartTooltip,
@@ -47,25 +46,30 @@ export const FinalityChart = memo(function FinalityChart({ events }: { events: E
     return points.slice(-MAX_POINTS)
   }, [events])
 
-  if (data.length === 0) return null
+  if (data.length === 0) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-muted-foreground py-4">
+        <Timer className="h-4 w-4" />
+        No finality samples yet. Run the swarm and play to generate proofs.
+      </div>
+    )
+  }
 
   const avg = Math.round(data.reduce((s, d) => s + d.finality, 0) / data.length)
   const min = Math.min(...data.map(d => d.finality))
   const max = Math.max(...data.map(d => d.finality))
 
   return (
-    <Card>
-      <CardHeader className="py-2 px-4">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Timer className="h-4 w-4" />
-          Consensus Finality
-          <span className="text-xs font-normal text-muted-foreground ml-auto">
-            avg {avg}ms &middot; min {min}ms &middot; max {max}ms &middot; last {data.length}
-          </span>
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="px-4 pb-3 pt-0">
-        <ChartContainer config={chartConfig} className="h-[120px] w-full">
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center gap-2 text-sm font-semibold shrink-0 mb-2">
+        <Timer className="h-4 w-4" />
+        Consensus Finality
+        <span className="text-xs font-normal text-muted-foreground ml-auto">
+          avg {avg}ms &middot; min {min}ms &middot; max {max}ms &middot; last {data.length}
+        </span>
+      </div>
+      <div className="flex-1 min-h-0">
+        <ChartContainer config={chartConfig} className="h-full w-full">
           <AreaChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
             <CartesianGrid vertical={false} />
             <XAxis
@@ -117,7 +121,7 @@ export const FinalityChart = memo(function FinalityChart({ events }: { events: E
             />
           </AreaChart>
         </ChartContainer>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 })

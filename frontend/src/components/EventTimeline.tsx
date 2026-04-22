@@ -1,5 +1,4 @@
 import { memo, useRef, useEffect, useMemo } from 'react'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Radio } from 'lucide-react'
 import { kindClass, kindIcon } from '@/lib/utils'
@@ -36,21 +35,19 @@ export const EventTimeline = memo(function EventTimeline({ proofs }: { proofs: P
   }, [events.length])
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Radio className="h-5 w-5" />
-          Event Timeline
-          <Badge variant="secondary">{events.length}</Badge>
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center gap-2 text-sm font-semibold shrink-0 mb-2">
+        <Radio className="h-4 w-4" />
+        Event Timeline
+        <Badge variant="secondary">{events.length}</Badge>
+      </div>
+      <div className="flex-1 min-h-0">
         {events.length === 0 ? (
           <p className="text-sm text-muted-foreground text-center py-8">
             No consensus events yet.
           </p>
         ) : (
-          <div ref={scrollRef} className="h-[400px] overflow-y-auto">
+          <div ref={scrollRef} className="h-full overflow-y-auto">
             <div className="relative pl-6 space-y-0">
               <div className="absolute left-[11px] top-0 bottom-0 w-px bg-border" />
 
@@ -84,7 +81,7 @@ export const EventTimeline = memo(function EventTimeline({ proofs }: { proofs: P
             </div>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 })

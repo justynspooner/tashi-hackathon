@@ -40,6 +40,27 @@ pub struct Rule {
     pub effect: serde_json::Value,
 }
 
+/// A circular obstacle on the playing field. When `blocks_los` is true, the
+/// obstacle breaks line-of-sight for any pair of nodes whose connecting
+/// segment passes through the disk — the partition reconciler firewalls such
+/// pairs off exactly like an over-range pair. Mirrors the `Obstacle` type in
+/// `frontend/src/game/presentation.ts`; keep the two in lockstep.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Obstacle {
+    pub x: f32,
+    pub y: f32,
+    pub r: f32,
+    /// Defaults to `true` when omitted — an obstacle with no explicit flag is
+    /// assumed to break LOS. Set to `false` for cosmetic-only rendering
+    /// decorations.
+    #[serde(default = "default_blocks_los")]
+    pub blocks_los: bool,
+}
+
+fn default_blocks_los() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameConfig {
     pub id: String,
@@ -57,6 +78,13 @@ pub struct GameConfig {
     /// as an MM:SS countdown. `None` means the game has no built-in timer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<u64>,
+    /// Static obstacles on the playing field. The partition reconciler
+    /// consults these on every tick so a pair whose connecting segment is
+    /// occluded by a blocking obstacle is firewalled off the same way an
+    /// over-range pair is. `#[serde(default)]` keeps old configs (no
+    /// `obstacles` field) parsing as an empty list.
+    #[serde(default)]
+    pub obstacles: Vec<Obstacle>,
 }
 
 pub fn load_all(dir: &Path) -> anyhow::Result<HashMap<String, GameConfig>> {

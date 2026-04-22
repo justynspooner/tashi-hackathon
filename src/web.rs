@@ -20,7 +20,7 @@ use tower_http::cors::CorsLayer;
 use crate::defaults::{
     COMM_RADIUS_M, FIELD_HEIGHT_M, FIELD_WIDTH_M, HYSTERESIS_M, MIN_SEP_M, RECONCILER_TICK_MS,
 };
-use crate::games::{self, GameConfig};
+use crate::games::{self, GameConfig, Obstacle};
 use crate::geom;
 use crate::pf::{normalize_pair, PfPartitionManager, PortPair};
 use crate::proof::ProofOfCoordination;
@@ -279,18 +279,68 @@ async fn file_watcher(state: Arc<AppState>) {
         let mut any_update = false;
 
         for label in &labels {
-            // Check for child process exit
-            {
+            // Check for child process exit. Capture the ExitStatus first, then
+            // release the mutex before doing any disk I/O to pull the stderr
+            // tail — we don't want to stall other file_watcher work while we
+            // read a potentially-large post-mortem buffer.
+            let exit_status = {
                 let mut nodes = state.nodes.lock().unwrap();
-                if let Some(handle) = nodes.get_mut(label) {
-                    if let Ok(Some(_status)) = handle.child.try_wait() {
-                        nodes.remove(label);
-                        let _ = state.sse_tx.send(
-                            serde_json::json!({"type": "node_status", "label": label, "status": "stopped"}).to_string(),
-                        );
-                        continue;
+                match nodes.get_mut(label) {
+                    Some(handle) => match handle.child.try_wait() {
+                        Ok(Some(status)) => {
+                            nodes.remove(label);
+                            Some(status)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                }
+            };
+            if let Some(status) = exit_status {
+                let _ = state.sse_tx.send(
+                    serde_json::json!({"type": "node_status", "label": label, "status": "stopped"}).to_string(),
+                );
+
+                let stderr_path =
+                    state.project_root.join(format!("artifacts/{label}-stderr.log"));
+                let tail = read_stderr_tail(&stderr_path, 8 * 1024);
+                let code_str = match status.code() {
+                    Some(c) => format!("exit code {c}"),
+                    None => "killed by signal".to_string(),
+                };
+                let message = match tail {
+                    Some(t) => format!("agent {label} exited ({code_str})\n---stderr tail---\n{t}"),
+                    None => format!("agent {label} exited ({code_str}); no stderr captured"),
+                };
+                // Print to the server's own stderr so it shows up in the
+                // terminal running `node serve`.
+                eprintln!("[{label}] {message}");
+
+                // Fan out as an `event_log` SSE entry so the UI timeline
+                // and the in-memory event buffer both pick it up without
+                // any frontend changes.
+                let ts = now_ms();
+                let entry = EventLogEntry {
+                    ts,
+                    tag: "CHILD_EXIT".to_string(),
+                    label: label.clone(),
+                    message: message.clone(),
+                };
+                let _ = state.sse_tx.send(
+                    serde_json::json!({
+                        "type": "event_log",
+                        "entry": {"ts": entry.ts, "tag": entry.tag, "label": entry.label, "message": entry.message}
+                    })
+                    .to_string(),
+                );
+                {
+                    let mut log = state.event_log.lock().unwrap();
+                    log.push_back(entry);
+                    while log.len() > 2000 {
+                        log.pop_front();
                     }
                 }
+                continue;
             }
 
             // Tail event log file
@@ -555,17 +605,30 @@ fn blocked_ports_to_labels(
     out
 }
 
-/// Pure hysteresis evaluator — given the current positions, port map, and
-/// which pairs are already blocked, return the set of pairs that *should*
-/// be blocked now. Hysteresis: a blocked pair only unblocks when distance <
-/// radius - HYSTERESIS; an unblocked pair only becomes blocked when distance
-/// > radius + HYSTERESIS. Extracted so it's unit-testable independent of
-/// `pfctl`, tokio, or the full `AppState`.
+/// Pure hysteresis evaluator — given the current positions, port map, which
+/// pairs are already blocked, and the active game's obstacles, return the set
+/// of pairs that *should* be blocked now.
+///
+/// Two independent reasons to block, OR'd together per pair:
+///
+/// 1. **Out of range.** Range hysteresis: a blocked pair only unblocks once
+///    distance < `radius − HYSTERESIS`; an unblocked pair only becomes
+///    blocked once distance > `radius + HYSTERESIS`.
+///
+/// 2. **Line-of-sight broken by an obstacle.** LOS hysteresis mirrors the
+///    range side (see `geom::has_los`): an unblocked pair stays connected
+///    until its connecting segment clearly plunges inside an obstacle
+///    (`r − HYSTERESIS`); a blocked pair stays blocked until its segment
+///    clearly clears every obstacle (`r + HYSTERESIS`).
+///
+/// Extracted so it's unit-testable independent of `pfctl`, tokio, or the full
+/// `AppState`.
 fn compute_desired_blocked(
     positions: &[(String, Position)],
     ports: &HashMap<String, u16>,
     currently_blocked_labels: &HashSet<(String, String)>,
     radius_m: f32,
+    obstacles: &[Obstacle],
 ) -> HashSet<PortPair> {
     let unblock_radius = (radius_m - HYSTERESIS_M).max(0.0);
     let block_radius = radius_m + HYSTERESIS_M;
@@ -584,11 +647,18 @@ fn compute_desired_blocked(
             };
             let was_blocked = currently_blocked_labels.contains(&(lo, hi));
 
-            let should_block = if was_blocked {
-                !geom::in_range(*pa, *pb, unblock_radius)
+            let (range_ok, los_ok) = if was_blocked {
+                (
+                    geom::in_range(*pa, *pb, unblock_radius),
+                    geom::has_los(*pa, *pb, obstacles, HYSTERESIS_M),
+                )
             } else {
-                !geom::in_range(*pa, *pb, block_radius)
+                (
+                    geom::in_range(*pa, *pb, block_radius),
+                    geom::has_los(*pa, *pb, obstacles, -HYSTERESIS_M),
+                )
             };
+            let should_block = !range_ok || !los_ok;
             if should_block {
                 desired.insert(normalize_pair(pa_port, pb_port));
             }
@@ -597,10 +667,41 @@ fn compute_desired_blocked(
     desired
 }
 
+/// Resolve the active game's obstacles by scanning the per-node game
+/// snapshots for an `active_game_id` and looking that id up in the loaded
+/// `GameConfig` table. Returns `None` when no node has settled on an active
+/// game yet (e.g. pre-vote, or after a swarm destroy) — callers treat that
+/// as "no obstacles in play".
+///
+/// We only need one snapshot to agree because consensus guarantees every
+/// node converges on the same `active_game_id`; scanning the map instead of
+/// picking a specific label avoids coupling to node labels.
+fn active_obstacles(state: &AppState) -> Vec<Obstacle> {
+    let active_id: Option<String> = {
+        let snaps = state.game_snapshots.lock().unwrap();
+        snaps
+            .values()
+            .find_map(|snap| {
+                snap.get("active_game_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    };
+    match active_id {
+        Some(id) => state
+            .games
+            .configs
+            .get(&id)
+            .map(|cfg| cfg.obstacles.clone())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
 /// Run one reconciliation pass: compute the desired blocked port set from
-/// (range-based + hysteresis) ∪ (user manual partitions) and push it through
-/// `pf.set_blocked`. Returns the diff when anything changed, or `None` on
-/// no-op.
+/// (range-based + LOS + hysteresis) ∪ (user manual partitions) and push it
+/// through `pf.set_blocked`. Returns the diff when anything changed, or
+/// `None` on no-op.
 ///
 /// Called both from the periodic reconciler loop and synchronously from the
 /// `create_partition`/`heal_partition` endpoints so user clicks take effect
@@ -623,8 +724,14 @@ async fn reconcile_once(
     let currently_blocked_labels =
         blocked_ports_to_labels(&current_blocked_ports, &port_to_label);
 
-    let mut desired_blocked =
-        compute_desired_blocked(&positions, &ports, &currently_blocked_labels, radius_m);
+    let obstacles = active_obstacles(state);
+    let mut desired_blocked = compute_desired_blocked(
+        &positions,
+        &ports,
+        &currently_blocked_labels,
+        radius_m,
+        &obstacles,
+    );
 
     // Overlay: user-severed label pairs always block regardless of range.
     {
@@ -940,6 +1047,35 @@ fn spawn_node(state: &Arc<AppState>, label: &str) -> bool {
             .arg("--peer-label").arg(peer_label);
     }
 
+    // Capture child stderr (+stdout) to a per-label file so post-mortem
+    // panics / Vertex errors survive the process exit. Truncated on every
+    // spawn so each restart starts from a clean buffer.
+    let stderr_path = state.project_root.join(format!("artifacts/{label}-stderr.log"));
+    let stderr_file = match std::fs::File::create(&stderr_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "[{label}] failed to open stderr log {}: {e}",
+                stderr_path.display()
+            );
+            return false;
+        }
+    };
+    // Duplicate the FD so stdout and stderr share one file; interleaving is
+    // fine because we only read it post-exit for diagnostics.
+    let stdout_file = match stderr_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[{label}] failed to clone stderr fd: {e}");
+            return false;
+        }
+    };
+    cmd.stderr(std::process::Stdio::from(stderr_file));
+    cmd.stdout(std::process::Stdio::from(stdout_file));
+    // Ask Rust to include a full backtrace if the child panics — the whole
+    // point of capturing stderr is to actually read the panic when it happens.
+    cmd.env("RUST_BACKTRACE", "1");
+
     // Restarting a fixed-member node with the same key/port works reliably here
     // when we let it resume the existing address book without the `--joining` flag.
     cmd.kill_on_drop(true);
@@ -960,6 +1096,25 @@ fn spawn_node(state: &Arc<AppState>, label: &str) -> bool {
             false
         }
     }
+}
+
+/// Read the last `max_bytes` of `path` for post-mortem diagnostics. Returns
+/// `None` if the file is missing, empty, or unreadable. Non-UTF-8 bytes are
+/// replaced with U+FFFD so the caller can safely format the result.
+fn read_stderr_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let cap = std::cmp::min(len, max_bytes) as usize;
+    let mut buf = Vec::with_capacity(cap);
+    file.read_to_end(&mut buf).ok()?;
+    let s = String::from_utf8_lossy(&buf).into_owned();
+    if s.trim().is_empty() { None } else { Some(s) }
 }
 
 async fn start_node(
@@ -1028,9 +1183,11 @@ async fn set_position(
     AxumPath(label): AxumPath<String>,
     Json(body): Json<PositionRequest>,
 ) -> Json<serde_json::Value> {
-    // Clamp to field.
-    let x = body.x.clamp(0.0, FIELD_WIDTH_M);
-    let y = body.y.clamp(0.0, FIELD_HEIGHT_M);
+    // The playing field is an infinite canvas — no clamp is applied. The
+    // `FIELD_WIDTH_M` / `FIELD_HEIGHT_M` defaults are only used as the
+    // random-spawn bounding box for auto-generated nodes in `add_node`.
+    let x = body.x;
+    let y = body.y;
 
     // Persist the new position on the node-config so it survives restarts.
     {
@@ -1499,7 +1656,7 @@ mod tests {
         // 9m apart with radius=8, hysteresis=0.5 → block_radius=8.5. 9 > 8.5 → block.
         positions[1].1 = pos(9.0, 0.0);
         let blocked: HashSet<(String, String)> = HashSet::new();
-        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
         assert_eq!(desired.len(), 1, "expected one blocked pair");
     }
 
@@ -1509,7 +1666,7 @@ mod tests {
         // 8.2m apart, radius=8, hysteresis=0.5 → block_radius=8.5. 8.2 <= 8.5 → no block.
         positions[1].1 = pos(8.2, 0.0);
         let blocked: HashSet<(String, String)> = HashSet::new();
-        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
         assert!(desired.is_empty(), "expected no blocks in hysteresis window");
     }
 
@@ -1520,7 +1677,7 @@ mod tests {
         positions[1].1 = pos(7.8, 0.0);
         let mut blocked: HashSet<(String, String)> = HashSet::new();
         blocked.insert(("a".into(), "b".into()));
-        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
         assert_eq!(desired.len(), 1, "expected still-blocked pair to stay blocked");
     }
 
@@ -1531,7 +1688,7 @@ mod tests {
         positions[1].1 = pos(7.4, 0.0);
         let mut blocked: HashSet<(String, String)> = HashSet::new();
         blocked.insert(("a".into(), "b".into()));
-        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
         assert!(desired.is_empty(), "expected pair to unblock");
     }
 
@@ -1548,7 +1705,7 @@ mod tests {
 
         for d in distances {
             positions[1].1 = pos(d, 0.0);
-            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
             let now_blocked: HashSet<(String, String)> = desired
                 .iter()
                 .map(|(a, b)| {
@@ -1578,7 +1735,7 @@ mod tests {
 
         for _ in 0..5 {
             positions[1].1 = pos(20.0, 0.0);
-            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
             blocked = desired
                 .iter()
                 .map(|_| ("a".to_string(), "b".to_string()))
@@ -1588,7 +1745,7 @@ mod tests {
 
         for _ in 0..5 {
             positions[1].1 = pos(3.0, 0.0);
-            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+            let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
             blocked = desired
                 .iter()
                 .map(|_| ("a".to_string(), "b".to_string()))
@@ -1634,7 +1791,162 @@ mod tests {
         ports.insert("b".into(), 40002);
         ports.insert("c".into(), 40003);
         let blocked: HashSet<(String, String)> = HashSet::new();
-        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0);
+        let desired = compute_desired_blocked(&positions, &ports, &blocked, 8.0, &[]);
         assert_eq!(desired.len(), 2, "expected 2 blocked pairs (a-c, b-c)");
+    }
+
+    // --- LOS-aware reconciler scenarios -----------------------------------
+    //
+    // The reconciler now considers line-of-sight alongside range: an
+    // obstacle sitting between two otherwise-in-range nodes firewalls them
+    // off exactly as if they were out of range, and symmetrically heals
+    // once the obstruction is gone. Hysteresis is applied to the obstacle
+    // radius so a node grazing the boundary doesn't flap.
+
+    fn obstacle(x: f32, y: f32, r: f32) -> Obstacle {
+        Obstacle { x, y, r, blocks_los: true }
+    }
+
+    #[test]
+    fn reconciler_blocks_pair_when_obstacle_breaks_los() {
+        // 4m apart (well inside the 8m range) but a 1m-radius obstacle sits
+        // exactly on their connecting segment. The pair should be blocked
+        // for LOS reasons even though the range check would allow them.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-2.0, 0.0);
+        positions[1].1 = pos(2.0, 0.0);
+        let obstacles = [obstacle(0.0, 0.0, 1.0)];
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert_eq!(
+            desired.len(),
+            1,
+            "expected LOS occlusion to produce one blocked pair",
+        );
+    }
+
+    #[test]
+    fn reconciler_leaves_pair_connected_when_obstacle_is_off_segment() {
+        // Same layout, but the obstacle is 5m off to the side — segment
+        // never gets close, so LOS is clear.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-2.0, 0.0);
+        positions[1].1 = pos(2.0, 0.0);
+        let obstacles = [obstacle(0.0, 5.0, 1.0)];
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert!(
+            desired.is_empty(),
+            "off-segment obstacle should not break LOS",
+        );
+    }
+
+    #[test]
+    fn reconciler_ignores_obstacles_marked_non_blocking() {
+        // An obstacle with `blocks_los: false` is cosmetic and must never
+        // firewall a pair, no matter how deeply the segment plunges into
+        // it.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-2.0, 0.0);
+        positions[1].1 = pos(2.0, 0.0);
+        let obstacles = [Obstacle { x: 0.0, y: 0.0, r: 1.0, blocks_los: false }];
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert!(desired.is_empty(), "cosmetic obstacle must not break LOS");
+    }
+
+    #[test]
+    fn reconciler_los_hysteresis_absorbs_grazing_segment() {
+        // The segment passes `r - 0.2` inside the obstacle — inside the
+        // nominal radius, but outside the `r - HYSTERESIS` plunge threshold.
+        // A currently-unblocked pair should stay unblocked. This mirrors
+        // the range side's dead band.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-2.0, 0.0);
+        positions[1].1 = pos(2.0, 0.0);
+        // Obstacle centre at (0, 0.8), r=1.0. Closest segment point is
+        // (0, 0) so segment-dist = 0.8 > r - HYSTERESIS = 0.5 → unblocked
+        // pair stays unblocked.
+        let obstacles = [obstacle(0.0, 0.8, 1.0)];
+        let blocked: HashSet<(String, String)> = HashSet::new();
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert!(
+            desired.is_empty(),
+            "grazing segment inside hysteresis band must not trigger new block",
+        );
+    }
+
+    #[test]
+    fn reconciler_los_hysteresis_keeps_blocked_pair_blocked_until_clear() {
+        // Same grazing geometry, but the pair is already LOS-blocked. It
+        // must stay blocked until the segment clears the obstacle by the
+        // full `r + HYSTERESIS` margin.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-2.0, 0.0);
+        positions[1].1 = pos(2.0, 0.0);
+        // Obstacle centre at (0, 1.2), r=1.0. segment-dist = 1.2 which is
+        // outside the nominal radius, but still inside r + H = 1.5. So a
+        // currently-blocked pair stays blocked.
+        let obstacles = [obstacle(0.0, 1.2, 1.0)];
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+        blocked.insert(("a".into(), "b".into()));
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert_eq!(
+            desired.len(),
+            1,
+            "blocked pair must stay blocked until segment clears r + H",
+        );
+    }
+
+    #[test]
+    fn reconciler_los_heals_once_segment_clearly_past_obstacle() {
+        // Pair is currently LOS-blocked. The obstacle is now 1.6m off the
+        // segment (> r + HYSTERESIS = 1.5), so the pair should heal.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-2.0, 0.0);
+        positions[1].1 = pos(2.0, 0.0);
+        let obstacles = [obstacle(0.0, 1.6, 1.0)];
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+        blocked.insert(("a".into(), "b".into()));
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert!(desired.is_empty(), "pair should heal once segment clears r + H");
+    }
+
+    #[test]
+    fn reconciler_los_drag_behind_obstacle_blocks_and_heals() {
+        // Scripted reproduction of the "drag a node behind an obstacle →
+        // disconnected; drag back → reconnected" scenario. Obstacle sits
+        // directly between the two nodes; then 'b' swings up to clear both
+        // the obstacle (LOS) and stay inside comm range.
+        //
+        // Geometry has to thread a narrow needle to heal: b must be close
+        // enough that `dist(a, b) < radius − HYSTERESIS = 7.5m` AND the
+        // segment must clear the obstacle by `r + HYSTERESIS`. A smaller
+        // obstacle (r=0.5) gives us that window at 6m horizontal reach.
+        let (mut positions, ports) = two_node_setup();
+        positions[0].1 = pos(-3.0, 0.0);
+        positions[1].1 = pos(3.0, 0.0);
+        let obstacles = [obstacle(0.0, 0.0, 0.5)];
+        let mut blocked: HashSet<(String, String)> = HashSet::new();
+
+        // Tick 1: segment passes through the obstacle's centre → block.
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert_eq!(desired.len(), 1, "segment through obstacle should block");
+        blocked.insert(("a".into(), "b".into()));
+
+        // Tick 2: lift 'b' to (3, 3). Closest segment-to-obstacle distance
+        // is ~1.34m (> r + HYSTERESIS = 1.0m) and |a-b| ≈ 6.7m (< 7.5m),
+        // so both range and LOS say "heal".
+        positions[1].1 = pos(3.0, 3.0);
+        let desired =
+            compute_desired_blocked(&positions, &ports, &blocked, 8.0, &obstacles);
+        assert!(desired.is_empty(), "clear segment should heal the pair");
     }
 }

@@ -9,7 +9,6 @@ import {
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Shield, ShieldCheck, ShieldX, ChevronDown, ChevronRight } from 'lucide-react'
 import type { ProofOfCoordination, VerifyResult } from '@/types'
 import { verifyProof } from '@/hooks/useApi'
@@ -67,28 +66,26 @@ export const ProofList = memo(function ProofList({ proofs: unsortedProofs }: { p
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Proofs of Coordination
-            <Badge variant="secondary">{proofs.length}</Badge>
-          </CardTitle>
-          {proofs.length > 0 && (
-            <Button size="sm" variant="outline" onClick={handleVerifyAll}>
-              Verify All
-            </Button>
-          )}
+    <div className="flex flex-col h-full min-h-0">
+      <div className="flex items-center justify-between mb-2 shrink-0">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <Shield className="h-4 w-4" />
+          Proofs of Coordination
+          <Badge variant="secondary">{proofs.length}</Badge>
         </div>
-      </CardHeader>
-      <CardContent>
+        {proofs.length > 0 && (
+          <Button size="sm" variant="outline" onClick={handleVerifyAll}>
+            Verify All
+          </Button>
+        )}
+      </div>
+      <div className="flex-1 min-h-0">
         {proofs.length === 0 ? (
           <p className="text-sm text-muted-foreground text-center py-8">
             No proofs generated yet. Run the agents with --proof-dir to generate proofs.
           </p>
         ) : (
-          <div ref={scrollRef} className="h-[500px] overflow-y-auto">
+          <div ref={scrollRef} className="h-full overflow-y-auto">
             <Table>
               <TableHeader>
                 <TableRow>
@@ -170,7 +167,7 @@ export const ProofList = memo(function ProofList({ proofs: unsortedProofs }: { p
             </Table>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 })

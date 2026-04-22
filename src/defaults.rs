@@ -1,8 +1,10 @@
 //! Constants shared between the web server and child nodes.
 //!
 //! Field dimensions are duplicated (in lockstep) with the frontend's
-//! `frontend/src/game/presentation.ts`. Obstacles live entirely in the frontend;
-//! backend uses range-only for `pfctl` reconciliation.
+//! `frontend/src/game/presentation.ts`. Obstacles are declared per-game in
+//! `games/*.json` (`obstacles: [...]`) and consumed by the partition
+//! reconciler so a pair whose line-of-sight is broken by a blocking obstacle
+//! is firewalled exactly like an over-range pair.
 
 /// Global communication radius in metres. A playing-field constant applied
 /// uniformly regardless of which game (if any) is loaded.

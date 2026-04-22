@@ -1,18 +1,25 @@
-import { useCallback, useState } from 'react'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Badge } from '@/components/ui/badge'
+import { useCallback, useMemo, useState } from 'react'
 import { ProofList } from '@/components/ProofList'
 import { EventTimeline } from '@/components/EventTimeline'
 import { EventLog } from '@/components/EventLog'
-import { NodeControl } from '@/components/NodeControl'
 import { FinalityChart } from '@/components/FinalityChart'
 import { GameView } from '@/components/GameView'
 import { ConsensusStalledBanner } from '@/components/ConsensusStalledBanner'
-import { Button } from '@/components/ui/button'
+import { TopChrome } from '@/components/top-chrome/TopChrome'
+import { SelectionProvider } from '@/state/SelectionContext'
+import { ActionsProvider } from '@/state/ActionsContext'
+import { DataProvider } from '@/state/DataContext'
+import { ObstaclesProvider } from '@/state/ObstaclesContext'
+import { Toaster } from '@/components/ui/sonner'
+import { AppShell } from '@/components/layout/AppShell'
+import { BottomDrawer, type DrawerTab } from '@/components/layout/BottomDrawer'
+import { SceneTree } from '@/components/scene-tree/SceneTree'
+import { InspectorRouter } from '@/components/inspector/InspectorRouter'
+import { CanvasArea } from '@/components/canvas/CanvasArea'
 import { useAgentStates, useProofs, useEventLog, useNodes, usePartitions, useSSE } from '@/hooks/useApi'
 import { useGameActions, useGames, useGameState } from '@/hooks/useGame'
+import { runWithToast } from '@/hooks/useErrorToast'
 import type { LocalGameSnapshot } from '@/game/types'
-import { Wifi, WifiOff, Trash2, Terminal } from 'lucide-react'
 
 export default function App() {
   const { states, refetch: refetchStates } = useAgentStates()
@@ -23,7 +30,9 @@ export default function App() {
   const { snapshots, applySnapshotUpdate, clear: clearGameState } = useGameState()
   const { games } = useGames()
   const { moveEntity, proposeGame, voteGame, claimEntity, readyUp } = useGameActions()
-  const [eventLogOpen, setEventLogOpen] = useState(false)
+
+  const [drawerTab, setDrawerTab] = useState<DrawerTab>('events')
+  const [drawerCollapsed, setDrawerCollapsed] = useState(false)
 
   const handleUpdate = useCallback(() => {
     refetchStates()
@@ -31,14 +40,23 @@ export default function App() {
     refetchNodes()
   }, [refetchStates, refetchProofs, refetchNodes])
 
-  async function handleClearArtifacts() {
-    await fetch('/api/clear-artifacts', { method: 'POST' })
+  const handleClearArtifacts = useCallback(async () => {
+    await runWithToast('Clear artifacts', async () => {
+      const res = await fetch('/api/clear-artifacts', { method: 'POST' })
+      if (!res.ok) throw new Error(`clear-artifacts failed: ${res.status}`)
+    })
     clearEvents()
     clearGameState()
     refetchNodes()
     refetchStates()
     refetchProofs()
-  }
+  }, [clearEvents, clearGameState, refetchNodes, refetchStates, refetchProofs])
+
+  const handleToggleEventLog = useCallback(() => {
+    // Top chrome's Event Log button routes to the drawer's Events tab.
+    setDrawerTab('events')
+    setDrawerCollapsed(false)
+  }, [])
 
   const { connected } = useSSE({
     onEventLog: appendEvent,
@@ -49,122 +67,88 @@ export default function App() {
       applySnapshotUpdate(label, snapshot as LocalGameSnapshot),
   })
 
+  const dataValue = useMemo(
+    () => ({ nodes, states, events, snapshots, games, proofs, partitions }),
+    [nodes, states, events, snapshots, games, proofs, partitions],
+  )
+
+  const actionsValue = useMemo(
+    () => ({
+      onStart: startNode,
+      onStop: stopNode,
+      onProposeGame: proposeGame,
+      onVoteGame: voteGame,
+      onClaimEntity: claimEntity,
+      onReadyUp: readyUp,
+      onTogglePartition: togglePartition,
+    }),
+    [startNode, stopNode, proposeGame, voteGame, claimEntity, readyUp, togglePartition],
+  )
+
   return (
-    <div className="h-screen bg-background flex flex-col overflow-hidden">
-      <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 px-6 py-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">
-              Tashi Vertex Explorer
-            </h1>
-            <p className="text-sm text-muted-foreground">
-              Live coordination events & proof verification
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={handleClearArtifacts}
-            >
-              <Trash2 className="h-3 w-3 mr-1" />
-              Clear Artifacts
-            </Button>
-            <Button
-              size="sm"
-              variant={eventLogOpen ? 'default' : 'outline'}
-              onClick={() => setEventLogOpen(o => !o)}
-            >
-              <Terminal className="h-3 w-3 mr-1" />
-              Event Log
-              {events.length > 0 && (
-                <Badge variant="secondary" className="ml-1.5 text-xs">{events.length}</Badge>
-              )}
-            </Button>
-            {connected ? (
-              <Badge variant="outline" className="gap-1">
-                <Wifi className="h-3 w-3 text-green-500" />
-                Live
-              </Badge>
-            ) : (
-              <Badge variant="outline" className="gap-1">
-                <WifiOff className="h-3 w-3 text-red-500" />
-                Disconnected
-              </Badge>
-            )}
-          </div>
-        </div>
-      </header>
+    <ObstaclesProvider>
+      <SelectionProvider nodes={nodes}>
+        <DataProvider value={dataValue}>
+          <ActionsProvider value={actionsValue}>
+            <AppShell
+              topChrome={
+                <TopChrome
+                  nodes={nodes}
+                  snapshots={snapshots}
+                  games={games}
+                  connected={connected}
+                  eventCount={events.length}
+                  eventLogOpen={drawerTab === 'events' && !drawerCollapsed}
+                  onToggleEventLog={handleToggleEventLog}
+                  onClearArtifacts={handleClearArtifacts}
+                  onCreateSwarm={createSwarm}
+                  onDestroySwarm={destroySwarm}
+                  onStart={startNode}
+                  onStop={stopNode}
+                  onProposeGame={proposeGame}
+                  onVoteGame={voteGame}
+                  onReadyUp={readyUp}
+                />
+              }
+              leftPanel={<SceneTree nodes={nodes} snapshots={snapshots} />}
+              center={
+                <CanvasArea>
+                  <GameView
+                    nodes={nodes}
+                    snapshots={snapshots}
+                    onMove={moveEntity}
+                    partitions={partitions}
+                    events={events}
+                    states={states}
+                    games={games}
+                    onTogglePartition={togglePartition}
+                  />
+                  {/* Headless watcher: fires toasts when consensus stalls or
+                      recovers. No visual surface. */}
+                  <ConsensusStalledBanner proofs={proofs} partitions={partitions} />
+                </CanvasArea>
+              }
+              rightPanel={<InspectorRouter />}
+              drawer={
+                <BottomDrawer
+                  tab={drawerTab}
+                  onTabChange={setDrawerTab}
+                  eventCount={events.length}
+                  proofCount={proofs.length}
+                  events={<EventLog events={events} onClear={clearEvents} />}
+                  timeline={<EventTimeline proofs={proofs} />}
+                  proofs={<ProofList proofs={proofs} />}
+                  chart={<FinalityChart events={events} />}
+                  collapsed={drawerCollapsed}
+                  onToggleCollapsed={() => setDrawerCollapsed(c => !c)}
+                />
+              }
+            />
 
-      <div className="flex flex-1 min-h-0">
-        <main className="flex-1 min-w-0 p-6 overflow-y-auto space-y-6">
-          {/* Node control — full width (network topology is now drawn
-              directly on top of the playing field below) */}
-          <NodeControl
-            nodes={nodes}
-            states={states}
-            events={events}
-            snapshots={snapshots}
-            games={games}
-            onStart={startNode}
-            onStop={stopNode}
-            onCreateSwarm={createSwarm}
-            onDestroySwarm={destroySwarm}
-            onProposeGame={proposeGame}
-            onVoteGame={voteGame}
-            onClaimEntity={claimEntity}
-            onReadyUp={readyUp}
-          />
-
-          {/* Playing field — full width. Now also hosts the comm graph: green
-              lines between connected peers, red dashed lines for any pair
-              without a link (user-severed or out of range). Tap any edge to
-              toggle a manual sever. */}
-          <GameView
-            nodes={nodes}
-            snapshots={snapshots}
-            onMove={moveEntity}
-            partitions={partitions}
-            events={events}
-            states={states}
-            games={games}
-            onTogglePartition={togglePartition}
-          />
-
-          {/* Consensus finality — full width */}
-          <ConsensusStalledBanner proofs={proofs} partitions={partitions} />
-          <FinalityChart events={events} />
-
-          {/* Proofs / Timeline */}
-          <Tabs defaultValue="proofs">
-            <TabsList>
-              <TabsTrigger value="proofs">
-                Proofs
-                {proofs.length > 0 && (
-                  <Badge variant="secondary" className="ml-2 text-xs">{proofs.length}</Badge>
-                )}
-              </TabsTrigger>
-              <TabsTrigger value="timeline">
-                Event Timeline
-              </TabsTrigger>
-            </TabsList>
-
-            <TabsContent value="proofs" className="mt-4">
-              <ProofList proofs={proofs} />
-            </TabsContent>
-
-            <TabsContent value="timeline" className="mt-4">
-              <EventTimeline proofs={proofs} />
-            </TabsContent>
-          </Tabs>
-        </main>
-
-        {eventLogOpen && (
-          <aside className="w-96 shrink-0 border-l bg-background flex flex-col">
-            <EventLog events={events} onClear={clearEvents} />
-          </aside>
-        )}
-      </div>
-    </div>
+            <Toaster richColors position="top-right" />
+          </ActionsProvider>
+        </DataProvider>
+      </SelectionProvider>
+    </ObstaclesProvider>
   )
 }

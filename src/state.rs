@@ -1,9 +1,8 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -227,31 +226,31 @@ pub fn persist_state(state: &RuntimeState) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Log path stored in a thread-local so `log()` can remain a free function
-// without needing a reference to RuntimeState.
-thread_local! {
-    static EVENT_LOG_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-    static WEB_TX: RefCell<Option<mpsc::UnboundedSender<WebEvent>>> = const { RefCell::new(None) };
-}
+// Process-global singletons so every tokio worker thread sees the same value.
+//
+// Previously these were thread_local!, which silently dropped log entries and
+// web events whenever a tokio task resumed on a worker thread that hadn't
+// called set_event_log_path / set_web_sender (which is all of them except the
+// one that ran the startup code). OnceLock is lock-free after initialisation
+// and correct across all threads.
+static EVENT_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static WEB_TX: OnceLock<Option<mpsc::UnboundedSender<WebEvent>>> = OnceLock::new();
 
 /// Set the global event-log path (call once at startup).
 pub fn set_event_log_path(path: Option<PathBuf>) {
-    EVENT_LOG_PATH.with(|p| *p.borrow_mut() = path);
+    let _ = EVENT_LOG_PATH.set(path);
 }
 
 /// Set the global web-event sender (call once at startup when running embedded).
 pub fn set_web_sender(tx: Option<mpsc::UnboundedSender<WebEvent>>) {
-    WEB_TX.with(|t| *t.borrow_mut() = tx);
+    let _ = WEB_TX.set(tx);
 }
 
 /// Send an event to the web server (no-op if no sender is set).
 pub fn send_web_event(event: WebEvent) {
-    WEB_TX.with(|tx| {
-        let tx = tx.borrow();
-        if let Some(ref tx) = *tx {
-            let _ = tx.send(event);
-        }
-    });
+    if let Some(Some(tx)) = WEB_TX.get() {
+        let _ = tx.send(event);
+    }
 }
 
 #[derive(Serialize)]
@@ -273,9 +272,7 @@ pub fn log(tag: &str, label: &str, msg: impl std::fmt::Display) {
         message: message.clone(),
     });
 
-    EVENT_LOG_PATH.with(|path| {
-        let path = path.borrow();
-        let Some(ref path) = *path else { return };
+    if let Some(Some(path)) = EVENT_LOG_PATH.get() {
         let entry = LogEntry {
             ts,
             tag,
@@ -291,7 +288,7 @@ pub fn log(tag: &str, label: &str, msg: impl std::fmt::Display) {
                 let _ = file.write_all(json.as_bytes());
             }
         }
-    });
+    }
 }
 
 pub fn now_ms() -> u64 {

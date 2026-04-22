@@ -1,15 +1,14 @@
-//! Pure geometry helpers for range checks and random entity placement.
-//!
-//! The backend deliberately does not implement line-of-sight — obstacles are
-//! frontend-only rendering concerns and do not influence `pfctl` partitions.
+//! Pure geometry helpers for range checks, line-of-sight, and random entity
+//! placement.
 //!
 //! Note: there's no all-pairs `connected_pairs` helper — the partition
 //! reconciler needs separate block/unblock radii for hysteresis, so it walks
-//! pairs itself using `in_range` at each threshold rather than reducing to a
-//! single radius.
+//! pairs itself using `in_range` (and `has_los`) at each threshold rather
+//! than reducing to a single radius.
 
 use rand::Rng;
 
+use crate::games::Obstacle;
 use crate::protocol::Position;
 
 /// Squared 2D distance.
@@ -28,6 +27,60 @@ pub fn dist(a: Position, b: Position) -> f32 {
 #[inline]
 pub fn in_range(a: Position, b: Position, radius_m: f32) -> bool {
     dist_sq(a, b) <= radius_m * radius_m
+}
+
+/// Shortest distance from point `c` to the line segment `a→b`. Used by the
+/// segment-vs-circle LOS check; factored out so the hysteresis-adjusted LOS
+/// test can reuse it against every obstacle.
+#[inline]
+pub fn point_to_segment_dist_sq(a: Position, b: Position, c: Position) -> f32 {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 == 0.0 {
+        let ex = a.x - c.x;
+        let ey = a.y - c.y;
+        return ex * ex + ey * ey;
+    }
+    let t = (((c.x - a.x) * dx + (c.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    let px = a.x + t * dx;
+    let py = a.y + t * dy;
+    let ex = px - c.x;
+    let ey = py - c.y;
+    ex * ex + ey * ey
+}
+
+/// Return `true` if the open segment `a→b` has clear line-of-sight past every
+/// blocking obstacle. An obstacle is considered to occlude the pair when the
+/// segment's closest approach to the obstacle's centre is `≤ o.r +
+/// radius_adjust`.
+///
+/// `radius_adjust` exists so the partition reconciler can apply hysteresis
+/// symmetrically with the range check:
+///
+/// * When deciding whether a currently-**unblocked** pair should *become*
+///   blocked, pass `-HYSTERESIS_M`. The segment must plunge clearly inside
+///   the nominal obstacle (`r − H`) before we firewall — a grazing pass stays
+///   connected. Mirrors the range side's "d > r + H to transition to blocked".
+///
+/// * When deciding whether a currently-**blocked** pair should *stay*
+///   blocked, pass `+HYSTERESIS_M`. The segment must clear the obstacle by a
+///   margin (`r + H`) before we heal. Mirrors "d < r − H to transition to
+///   unblocked".
+///
+/// Passing `0.0` disables hysteresis (used by the frontend's one-shot check).
+pub fn has_los(a: Position, b: Position, obstacles: &[Obstacle], radius_adjust: f32) -> bool {
+    for o in obstacles {
+        if !o.blocks_los {
+            continue;
+        }
+        let effective_r = (o.r + radius_adjust).max(0.0);
+        let r2 = effective_r * effective_r;
+        if point_to_segment_dist_sq(a, b, Position { x: o.x, y: o.y }) <= r2 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Draw a position uniformly in the field, rejecting if within `min_sep_m` of
@@ -153,6 +206,90 @@ mod tests {
         let pb = Position { x: 3.0, y: 4.0 };
         assert!(in_range(pa, pb, 5.0));
         assert!(!in_range(pa, pb, 4.9));
+    }
+
+    fn obs(x: f32, y: f32, r: f32, blocks: bool) -> Obstacle {
+        Obstacle { x, y, r, blocks_los: blocks }
+    }
+
+    #[test]
+    fn has_los_clear_with_no_obstacles() {
+        let a = Position { x: 0.0, y: 0.0 };
+        let b = Position { x: 10.0, y: 0.0 };
+        assert!(has_los(a, b, &[], 0.0));
+    }
+
+    #[test]
+    fn has_los_segment_through_obstacle_is_blocked() {
+        let a = Position { x: -5.0, y: 0.0 };
+        let b = Position { x: 5.0, y: 0.0 };
+        let obstacles = [obs(0.0, 0.0, 1.0, true)];
+        assert!(!has_los(a, b, &obstacles, 0.0));
+    }
+
+    #[test]
+    fn has_los_segment_missing_obstacle_is_clear() {
+        let a = Position { x: -5.0, y: 0.0 };
+        let b = Position { x: 5.0, y: 0.0 };
+        let obstacles = [obs(0.0, 5.0, 1.0, true)];
+        assert!(has_los(a, b, &obstacles, 0.0));
+    }
+
+    #[test]
+    fn has_los_ignores_cosmetic_obstacles() {
+        // blocks_los=false must be treated as a pure rendering decoration.
+        let a = Position { x: -5.0, y: 0.0 };
+        let b = Position { x: 5.0, y: 0.0 };
+        let obstacles = [obs(0.0, 0.0, 1.0, false)];
+        assert!(has_los(a, b, &obstacles, 0.0));
+    }
+
+    #[test]
+    fn has_los_hysteresis_deflates_obstacle_when_negative_adjust() {
+        // Segment passes 0.6m from the obstacle centre (r=1.0). Nominal
+        // radius says "blocked"; with radius_adjust=-0.5 the effective
+        // radius is 0.5, which is *smaller* than the 0.6m clearance → LOS
+        // clear. Used by the reconciler's "should I *become* blocked?"
+        // arm.
+        let a = Position { x: -5.0, y: 0.6 };
+        let b = Position { x: 5.0, y: 0.6 };
+        let obstacles = [obs(0.0, 0.0, 1.0, true)];
+        assert!(!has_los(a, b, &obstacles, 0.0), "nominal radius should block");
+        assert!(has_los(a, b, &obstacles, -0.5), "deflated radius should clear");
+    }
+
+    #[test]
+    fn has_los_hysteresis_inflates_obstacle_when_positive_adjust() {
+        // Segment passes 1.2m from the obstacle centre (r=1.0). Nominally
+        // clear, but with radius_adjust=+0.5 the effective radius is 1.5,
+        // which exceeds the 1.2m clearance → LOS blocked. Used by the
+        // reconciler's "should I *stay* blocked?" arm.
+        let a = Position { x: -5.0, y: 1.2 };
+        let b = Position { x: 5.0, y: 1.2 };
+        let obstacles = [obs(0.0, 0.0, 1.0, true)];
+        assert!(has_los(a, b, &obstacles, 0.0), "nominal radius should clear");
+        assert!(!has_los(a, b, &obstacles, 0.5), "inflated radius should block");
+    }
+
+    #[test]
+    fn has_los_short_circuits_on_first_blocker() {
+        // Segment would also pass through a later obstacle, but the first
+        // blocker is enough to return false — we don't need a specific
+        // "which obstacle blocked" answer, just a boolean.
+        let a = Position { x: -10.0, y: 0.0 };
+        let b = Position { x: 10.0, y: 0.0 };
+        let obstacles = [obs(-3.0, 0.0, 0.5, true), obs(3.0, 0.0, 0.5, true)];
+        assert!(!has_los(a, b, &obstacles, 0.0));
+    }
+
+    #[test]
+    fn point_to_segment_dist_zero_length_segment() {
+        // Degenerate case: both endpoints coincide. The "segment" collapses
+        // to a point, so the distance is just point-to-point.
+        let a = Position { x: 2.0, y: 2.0 };
+        let b = Position { x: 2.0, y: 2.0 };
+        let c = Position { x: 5.0, y: 6.0 };
+        assert!((point_to_segment_dist_sq(a, b, c) - 25.0).abs() < 1e-5);
     }
 
     #[test]

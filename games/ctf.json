@@ -12,6 +12,11 @@
     { "entity": "player", "requires": { "kind": "within_m_of",        "entity": "base", "same_team": true, "max_m": 2.0 } },
     { "entity": "flag",   "requires": { "kind": "farther_than_m_from", "entity": "base",                   "min_m": 10.0 } }
   ],
+  "obstacles": [
+    { "x": 20, "y": 10, "r": 1.8, "blocks_los": true },
+    { "x": 40, "y": 20, "r": 2.2, "blocks_los": true },
+    { "x": 30, "y": 15, "r": 1.5, "blocks_los": true }
+  ],
   "rules": [
     {
       "//": "Mark who currently holds the flag — fires on the base whose node sees the flag within 1m for 1s, sets flag.holding_team. The value only changes when a different team brings the flag home, so the delta handler treats repeated re-applies as no-ops (UI-stable).",

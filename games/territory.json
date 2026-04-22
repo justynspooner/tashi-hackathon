@@ -7,6 +7,10 @@
     { "id": "player", "min": 2, "max": 4, "team": "per_team", "visual": "player" }
   ],
   "placement": [],
+  "obstacles": [
+    { "x": 15, "y": 8,  "r": 1.6, "blocks_los": true },
+    { "x": 45, "y": 22, "r": 1.6, "blocks_los": true }
+  ],
   "rules": [
     {
       "id": "claim_zone",

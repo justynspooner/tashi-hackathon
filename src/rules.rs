@@ -171,6 +171,16 @@ enum Predicate {
         peer_entity_type: String,
         max_m: f32,
         min_s: u64,
+        /// When `true`, only peer entities sharing `self`'s team qualify.
+        /// Both entities must have `Some(team)` — two `None`-team entities
+        /// do *not* count as "same team."
+        #[serde(default)]
+        same_team: bool,
+        /// When `true`, only peer entities on a *different* team qualify.
+        /// Both must have `Some(team)`. Setting both `same_team` and
+        /// `different_team` is contradictory and the predicate always fails.
+        #[serde(default)]
+        different_team: bool,
     },
     /// One of the patches applied in this evaluation changed `key` on an
     /// entity of `target_entity_type`. Meaningful only under
@@ -341,7 +351,7 @@ fn eval_predicate(
         Predicate::EntityIs { entity_type } => {
             self_entity.entity_type.as_deref() == Some(entity_type.as_str())
         }
-        Predicate::ProximityDurationS { peer_entity_type, max_m: _, min_s } => {
+        Predicate::ProximityDurationS { peer_entity_type, max_m: _, min_s, same_team, different_team } => {
             // Proximity tracker is maintained by `update_proximity`. A key
             // exists iff the pair has been within the rule's max_m continuously.
             // We check the tracker for any peer of `peer_entity_type` whose
@@ -351,6 +361,15 @@ fn eval_predicate(
                 .entities
                 .values()
                 .filter(|e| e.entity_type.as_deref() == Some(peer_entity_type.as_str()))
+                .filter(|peer| {
+                    if *same_team {
+                        matches!((&self_entity.team, &peer.team), (Some(st), Some(pt)) if st == pt)
+                    } else if *different_team {
+                        matches!((&self_entity.team, &peer.team), (Some(st), Some(pt)) if st != pt)
+                    } else {
+                        true
+                    }
+                })
                 .any(|peer| {
                     let key = proximity_key(&rule.id, &self_entity.label, &peer.label);
                     ctx.local
@@ -588,6 +607,19 @@ pub fn update_proximity(
                 if p_entity.peer_id == s_entity.peer_id {
                     continue;
                 }
+                // Team filtering — must match eval_predicate semantics.
+                if r.same_team {
+                    match (&s_entity.team, &p_entity.team) {
+                        (Some(st), Some(pt)) if st == pt => {}
+                        _ => continue,
+                    }
+                }
+                if r.different_team {
+                    match (&s_entity.team, &p_entity.team) {
+                        (Some(st), Some(pt)) if st != pt => {}
+                        _ => continue,
+                    }
+                }
                 let Some(p_pos) = p_entity.pos else { continue };
                 let key = proximity_key(&r.rule_id, &s_entity.label, &p_entity.label);
                 if geom::in_range(s_pos, p_pos, r.max_m) {
@@ -626,6 +658,8 @@ fn collect_proximity_predicates(
                     peer_entity_type,
                     max_m,
                     min_s: _,
+                    same_team,
+                    different_team,
                 } = child
                 {
                     if let Some(st) = &self_type {
@@ -634,6 +668,8 @@ fn collect_proximity_predicates(
                             self_type: st.clone(),
                             peer_type: peer_entity_type.clone(),
                             max_m: *max_m,
+                            same_team: *same_team,
+                            different_team: *different_team,
                         });
                     }
                 }
@@ -650,6 +686,8 @@ struct ProximityTrack {
     self_type: String,
     peer_type: String,
     max_m: f32,
+    same_team: bool,
+    different_team: bool,
 }
 
 fn proximity_key(rule_id: &str, label_a: &str, label_b: &str) -> String {
@@ -881,6 +919,7 @@ mod tests {
             placement: vec![],
             rules: vec![],
             duration_s: None,
+            obstacles: vec![],
         }
     }
 
@@ -966,6 +1005,7 @@ mod tests {
             ],
             rules: vec![],
             duration_s: None,
+            obstacles: vec![],
         }
     }
 
@@ -1162,6 +1202,122 @@ mod tests {
         state.entities.get_mut("flg").unwrap().pos = Some(crate::protocol::Position { x: 0.5, y: 0.0 });
         update_proximity(&mut state, &game, 7000);
         assert_eq!(state.proximity_tracker.get(&key), Some(&7000));
+    }
+
+    // --- Team-filtered proximity tests ---
+
+    /// Build a game with a single `proximity_duration_s` rule that has the
+    /// given `same_team` / `different_team` flags. Two player entity types
+    /// so we can test peer matching independently of self.
+    fn game_with_team_proximity(same_team: bool, different_team: bool) -> GameConfig {
+        GameConfig {
+            id: "team_prox".into(),
+            name: "Team Proximity Test".into(),
+            teams: vec!["red".into(), "blue".into()],
+            entity_types: vec![
+                crate::games::EntityTypeDef { id: "player".into(), min: 1, max: 6, team: Some("per_team".into()), visual: None },
+            ],
+            placement: vec![],
+            rules: vec![crate::games::Rule {
+                id: "team_prox_rule".into(),
+                on: "tick".into(),
+                when: serde_json::json!({
+                    "kind": "all",
+                    "of": [
+                        { "kind": "entity_is", "entity_type": "player" },
+                        { "kind": "proximity_duration_s", "peer_entity_type": "player", "max_m": 3.0, "min_s": 2, "same_team": same_team, "different_team": different_team }
+                    ]
+                }),
+                effect: serde_json::json!({
+                    "kind": "increment_score",
+                    "team": "self.team",
+                    "by": 1
+                }),
+            }],
+            duration_s: None,
+            obstacles: vec![],
+        }
+    }
+
+    #[test]
+    fn proximity_same_team_only_tracks_matching() {
+        let game = game_with_team_proximity(true, false);
+        let mut state = LocalGameState::new("a".into(), "PK_A".into(), None);
+        state.active_game_id = Some("team_prox".into());
+        // Red player A at (0,0), red player B at (1,0), blue player C at (2,0).
+        state.entities.insert("a".into(), entity("a", "PK_A", Some("player"), Some("red"), Some((0.0, 0.0))));
+        state.entities.insert("b".into(), entity("b", "PK_B", Some("player"), Some("red"), Some((1.0, 0.0))));
+        state.entities.insert("c".into(), entity("c", "PK_C", Some("player"), Some("blue"), Some((2.0, 0.0))));
+
+        update_proximity(&mut state, &game, 1000);
+
+        // A↔B are same team (red) and within 3m → tracked.
+        let key_ab = proximity_key("team_prox_rule", "a", "b");
+        assert!(state.proximity_tracker.contains_key(&key_ab), "same-team pair A↔B should be tracked");
+
+        // A↔C are different teams → NOT tracked under same_team.
+        let key_ac = proximity_key("team_prox_rule", "a", "c");
+        assert!(!state.proximity_tracker.contains_key(&key_ac), "cross-team pair A↔C should NOT be tracked");
+
+        // B↔C are different teams → NOT tracked under same_team.
+        let key_bc = proximity_key("team_prox_rule", "b", "c");
+        assert!(!state.proximity_tracker.contains_key(&key_bc), "cross-team pair B↔C should NOT be tracked");
+    }
+
+    #[test]
+    fn proximity_different_team_only_tracks_opposing() {
+        let game = game_with_team_proximity(false, true);
+        let mut state = LocalGameState::new("a".into(), "PK_A".into(), None);
+        state.active_game_id = Some("team_prox".into());
+        state.entities.insert("a".into(), entity("a", "PK_A", Some("player"), Some("red"), Some((0.0, 0.0))));
+        state.entities.insert("b".into(), entity("b", "PK_B", Some("player"), Some("red"), Some((1.0, 0.0))));
+        state.entities.insert("c".into(), entity("c", "PK_C", Some("player"), Some("blue"), Some((2.0, 0.0))));
+
+        update_proximity(&mut state, &game, 1000);
+
+        // A↔B are same team → NOT tracked under different_team.
+        let key_ab = proximity_key("team_prox_rule", "a", "b");
+        assert!(!state.proximity_tracker.contains_key(&key_ab), "same-team pair A↔B should NOT be tracked");
+
+        // A↔C are different teams and within 3m → tracked.
+        let key_ac = proximity_key("team_prox_rule", "a", "c");
+        assert!(state.proximity_tracker.contains_key(&key_ac), "cross-team pair A↔C should be tracked");
+
+        // B↔C are different teams and within 3m → tracked.
+        let key_bc = proximity_key("team_prox_rule", "b", "c");
+        assert!(state.proximity_tracker.contains_key(&key_bc), "cross-team pair B↔C should be tracked");
+    }
+
+    #[test]
+    fn proximity_same_team_none_excluded() {
+        // Two entities with team: None should NOT match same_team: true.
+        let game = game_with_team_proximity(true, false);
+        let mut state = LocalGameState::new("a".into(), "PK_A".into(), None);
+        state.active_game_id = Some("team_prox".into());
+        state.entities.insert("a".into(), entity("a", "PK_A", Some("player"), None, Some((0.0, 0.0))));
+        state.entities.insert("b".into(), entity("b", "PK_B", Some("player"), None, Some((1.0, 0.0))));
+
+        update_proximity(&mut state, &game, 1000);
+
+        let key_ab = proximity_key("team_prox_rule", "a", "b");
+        assert!(!state.proximity_tracker.contains_key(&key_ab), "two None-team entities should NOT match same_team");
+    }
+
+    #[test]
+    fn proximity_both_flags_never_fires() {
+        // Contradictory: both same_team and different_team are true.
+        // Nothing should ever be tracked.
+        let game = game_with_team_proximity(true, true);
+        let mut state = LocalGameState::new("a".into(), "PK_A".into(), None);
+        state.active_game_id = Some("team_prox".into());
+        state.entities.insert("a".into(), entity("a", "PK_A", Some("player"), Some("red"), Some((0.0, 0.0))));
+        state.entities.insert("b".into(), entity("b", "PK_B", Some("player"), Some("red"), Some((1.0, 0.0))));
+        state.entities.insert("c".into(), entity("c", "PK_C", Some("player"), Some("blue"), Some((2.0, 0.0))));
+
+        update_proximity(&mut state, &game, 1000);
+
+        // same_team passes for A↔B but different_team then rejects it.
+        assert!(state.proximity_tracker.is_empty(), "contradictory flags should produce no tracker entries");
     }
 
     #[test]

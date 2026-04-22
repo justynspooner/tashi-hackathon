@@ -1,25 +1,34 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as d3 from 'd3'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import type { AgentState, EventLogEntry, NodeInfo } from '../types'
 import type { GameConfig, LocalGameSnapshot, Position } from '../game/types'
 import {
   COMM_RADIUS_M,
-  FIELD_HEIGHT_M,
-  FIELD_HEIGHT_PX,
-  FIELD_WIDTH_M,
-  FIELD_WIDTH_PX,
   PX_PER_M,
-  clampToField,
   fromPxX,
   fromPxY,
-  presentationFor,
   teamColor,
   toPxX,
   toPxY,
 } from '../game/presentation'
 import { hasLos, inRange } from '../game/geom'
+import { useSelection } from '@/state/SelectionContext'
+import { useObstacles, type ObstacleRecord } from '@/state/ObstaclesContext'
+import { edgeKey } from '@/game/edgeKey'
+import { SelectionRing } from '@/components/canvas/SelectionRing'
+import { CanvasHudSourceIndicator } from '@/components/canvas/CanvasHudSourceIndicator'
+import { EdgeHoverToggle } from '@/components/canvas/EdgeHoverToggle'
+import { GameTimer } from '@/components/canvas/huds/GameTimer'
+import { Scoreboard } from '@/components/canvas/huds/Scoreboard'
+import { FlagHolderBadge } from '@/components/canvas/huds/FlagHolderBadge'
+import { CountdownOverlay } from '@/components/canvas/huds/CountdownOverlay'
+import { EndedBanner } from '@/components/canvas/huds/EndedBanner'
+import { selectHudSourceLabel } from '@/state/selectors'
+
+/** Drag-vs-click threshold in screen pixels. Below this we treat the gesture
+ *  as a selection click rather than a move. */
+const CLICK_DRAG_THRESHOLD_PX = 3
 
 interface GameViewProps {
   nodes: NodeInfo[]
@@ -118,16 +127,44 @@ export function GameView({
   const effectsLayerRef = useRef<SVGGElement | null>(null)
   // During drag, we locally override positions; on drop we commit to backend.
   const [dragOverrides, setDragOverrides] = useState<Record<string, Position>>({})
+  // Local overrides for obstacles during drag-move / drag-resize. Patch is
+  // {x,y} while moving, {r} while resizing (no overlap — each gesture has
+  // one obstacle in flight). Committed to ObstaclesContext on drag end.
+  const [obstacleOverrides, setObstacleOverrides] = useState<
+    Record<string, { x?: number; y?: number; r?: number }>
+  >({})
   // Current zoom transform — stored so the drag handlers below can compensate
   // for pan/zoom when converting pointer coordinates back to field metres.
   const transformRef = useRef<{ k: number; x: number; y: number }>({ k: 1, x: 0, y: 0 })
-  // Stable drag behaviour built once on mount; re-attached to entity groups
-  // only when the set of entities changes (see below).
+  // Stable drag behaviours built once on mount; re-attached to DOM groups
+  // whenever the set of entities / obstacles changes (see below).
   const dragBehaviorRef = useRef<d3.DragBehavior<SVGGElement, unknown, unknown> | null>(null)
+  const obstacleDragRef = useRef<d3.DragBehavior<SVGGElement, unknown, unknown> | null>(null)
+  const obstacleResizeRef = useRef<d3.DragBehavior<SVGGElement, unknown, unknown> | null>(null)
+  // Stable zoom behaviour, also built once on mount. Exposed via ref so the
+  // one-shot initial-fit effect (below) can apply a programmatic transform
+  // through the same d3-zoom state machine the user drives.
+  const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null)
+  // Latches `true` after the first fit-to-entities has been applied. Prevents
+  // the initial-fit from yanking the camera around when new nodes spawn.
+  const hasFitInitialRef = useRef(false)
   // Always-latest `onMove` callback so the drag-end handler doesn't need the
   // zoom/drag setup to re-run on every prop change.
   const onMoveRef = useRef(onMove)
   useEffect(() => { onMoveRef.current = onMove })
+
+  // Selection wiring: read via ref so the drag-end handler keeps a stable
+  // closure even when the selection updates.
+  const selectionApi = useSelection()
+  const selectionApiRef = useRef(selectionApi)
+  useEffect(() => { selectionApiRef.current = selectionApi })
+
+  // `onTogglePartition` stays in the prop surface so callers don't need to
+  // rewire when EdgeHoverToggle lands in Phase 5. Reference it via a ref so
+  // TypeScript sees it as consumed and so the Phase 5 overlay can pick it up
+  // without a re-prop.
+  const onTogglePartitionRef = useRef(onTogglePartition)
+  useEffect(() => { onTogglePartitionRef.current = onTogglePartition })
 
   const activeGameId = useMemo<string | null>(() => {
     for (const snap of Object.values(snapshots)) {
@@ -136,7 +173,29 @@ export function GameView({
     return null
   }, [snapshots])
 
-  const presentation = useMemo(() => presentationFor(activeGameId), [activeGameId])
+  // Obstacles live in ObstaclesContext — the user places / moves / resizes
+  // them manually. We keep a ref of the latest list so drag handlers can
+  // look up an obstacle's current geometry without reinstalling when the
+  // list changes.
+  const { obstacles, updateObstacle } = useObstacles()
+  const obstaclesRef = useRef<ObstacleRecord[]>(obstacles)
+  useEffect(() => {
+    obstaclesRef.current = obstacles
+  }, [obstacles])
+  const updateObstacleRef = useRef(updateObstacle)
+  useEffect(() => {
+    updateObstacleRef.current = updateObstacle
+  })
+
+  // Effective obstacles: merge in any live drag overrides so the canvas
+  // (and the LOS edge colouring) tracks the cursor in real time.
+  const effectiveObstacles = useMemo<ObstacleRecord[]>(() => {
+    if (Object.keys(obstacleOverrides).length === 0) return obstacles
+    return obstacles.map(o => {
+      const ov = obstacleOverrides[o.id]
+      return ov ? { ...o, ...ov } : o
+    })
+  }, [obstacles, obstacleOverrides])
 
   // Comm radius is a global playing-field constant — in lockstep with the
   // backend `partition_reconciler`.
@@ -175,6 +234,14 @@ export function GameView({
     return s
   }, [partitions])
 
+  // Stable key that changes when obstacles are added / removed (the `set`
+  // changes), not on every reposition. Used to gate the obstacle-drag
+  // re-attachment effect below, mirroring the pattern for entities.
+  const obstacleIdsKey = useMemo(
+    () => obstacles.map(o => o.id).sort().join(','),
+    [obstacles],
+  )
+
   // Compute edges for every pair of entities. Pairs that are out of range,
   // blocked by an obstacle, or marked partitioned by the backend are shown as
   // red dashed "severed" lines; in-range LOS-clear pairs that aren't in the
@@ -190,13 +257,13 @@ export function GameView({
         const pb = effectivePos[eb.label]
         if (!pa || !pb) continue
         const key = ea.label < eb.label ? `${ea.label}|${eb.label}` : `${eb.label}|${ea.label}`
-        const inLosRange = inRange(pa, pb, commRadiusM) && hasLos(pa, pb, presentation.obstacles)
+        const inLosRange = inRange(pa, pb, commRadiusM) && hasLos(pa, pb, effectiveObstacles)
         const partitioned = partitionedSet.has(key)
         edges.push({ a: ea.label, b: eb.label, connected: inLosRange && !partitioned })
       }
     }
     return edges
-  }, [entities, effectivePos, commRadiusM, presentation.obstacles, partitionedSet])
+  }, [entities, effectivePos, commRadiusM, effectiveObstacles, partitionedSet])
 
   // Set up D3 drag + zoom behaviour ONCE on mount.
   //
@@ -224,12 +291,15 @@ export function GameView({
       .scaleExtent([0.5, 3])
       .filter(event => {
         // Let mousedown/touchstart on an entity fall through to the drag
-        // handler, and on a comm edge fall through to its click handler.
-        // Wheels and background drags still pan/zoom.
+        // handler, and on a comm edge fall through to its click handler, and
+        // on an obstacle (or its resize handle) fall through to their drag
+        // handlers. Wheels and background drags still pan/zoom.
         if (event.type === 'wheel') return true
         const target = event.target as Element | null
         if (target?.closest('g.entity-group')) return false
         if (target?.closest('g.comm-edge')) return false
+        if (target?.closest('g.obstacle-group')) return false
+        if (target?.closest('g.obstacle-handle')) return false
         return !event.ctrlKey && !event.button
       })
       .on('zoom', event => {
@@ -242,40 +312,73 @@ export function GameView({
       })
 
     svg.call(zoom)
+    zoomBehaviorRef.current = zoom
 
-    // Convert a pointer event's client-space (x,y) into field metres,
-    // compensating for the current zoom/pan transform.
+    // Convert a d3-drag event's (x, y) into field metres. d3-drag uses
+    // d3.pointer with a default container of the dragged element's parent
+    // (`g.entities`), and d3.pointer applies `getScreenCTM().inverse()` —
+    // which already undoes the zoom-layer's transform. So `event.x`/`event.y`
+    // are in the *pre-zoom* pixel coordinate space (the same space `toPxX`
+    // outputs), and we just divide by `PX_PER_M` to get metres.
+    //
+    // (Earlier this also subtracted the zoom transform's translate and divided
+    // by its scale — that was double-undoing the zoom and made the dropped
+    // node land at an offset from the cursor that grew with the pan offset.)
+    //
+    // The canvas is infinite, so we do not clamp — entities can be dragged
+    // anywhere.
     const toFieldM = (event: { x: number; y: number }) => {
-      const { k, x, y } = transformRef.current
-      const xPx = (event.x - x) / k
-      const yPx = (event.y - y) / k
-      return clampToField({ x: fromPxX(xPx), y: fromPxY(yPx) })
+      return { x: fromPxX(event.x), y: fromPxY(event.y) }
     }
 
     // React owns the entity DOM, so `.call(drag)` can't rely on `__data__`
     // being bound (it isn't — React doesn't set it). Read the label from the
     // `data-label` attribute stamped onto each `g.entity-group` instead.
-    // Stopped nodes have `data-running="false"` — filter those out at the
-    // d3.drag level so we don't start an interaction that can't be applied.
+    //
+    // Click vs drag (A5 + B2): track screen-space distance from mousedown;
+    // if the gesture moves < CLICK_DRAG_THRESHOLD_PX pixels we emit a
+    // selection click instead of committing a move. Threshold is in screen
+    // px (NOT field metres) so it's zoom-invariant.
+    const dragState = { startX: 0, startY: 0, wasDrag: false }
     const drag = d3
       .drag<SVGGElement, unknown>()
       .filter(function () {
-        const el = this as SVGGElement
-        return el.getAttribute('data-running') !== 'false'
+        // Entity is always clickable (even when stopped) so a stopped node's
+        // label can still be selected. Drag-move is blocked for stopped
+        // nodes inside the handler.
+        return true
       })
-      .on('start', function () {
-        d3.select(this).raise().classed('dragging', true)
+      .on('start', function (event) {
+        dragState.startX = event.sourceEvent.clientX
+        dragState.startY = event.sourceEvent.clientY
+        dragState.wasDrag = false
+        d3.select(this).raise()
       })
       .on('drag', function (event) {
-        const label = (this as SVGGElement).getAttribute('data-label')
+        const el = this as SVGGElement
+        if (el.getAttribute('data-running') === 'false') return
+        const dx = event.sourceEvent.clientX - dragState.startX
+        const dy = event.sourceEvent.clientY - dragState.startY
+        if (Math.hypot(dx, dy) >= CLICK_DRAG_THRESHOLD_PX) {
+          dragState.wasDrag = true
+          d3.select(this).classed('dragging', true)
+        }
+        if (!dragState.wasDrag) return
+        const label = el.getAttribute('data-label')
         if (!label) return
         const p = toFieldM(event)
         setDragOverrides(prev => ({ ...prev, [label]: p }))
       })
       .on('end', function (event) {
         d3.select(this).classed('dragging', false)
-        const label = (this as SVGGElement).getAttribute('data-label')
+        const el = this as SVGGElement
+        const label = el.getAttribute('data-label')
         if (!label) return
+        if (!dragState.wasDrag) {
+          // Treat as click — select the node (A5).
+          selectionApiRef.current.selectNode(label)
+          return
+        }
         const p = toFieldM(event)
         setDragOverrides(prev => {
           const copy = { ...prev }
@@ -289,10 +392,141 @@ export function GameView({
     dragBehaviorRef.current = drag
     svg.selectAll<SVGGElement, unknown>('g.entity-group').call(drag)
 
+    // --- Obstacle move (click-to-select, drag-to-reposition) ---
+    //
+    // Mirrors the entity pattern: a screen-pixel threshold distinguishes a
+    // click (select) from a drag (move). Offset capture keeps the cursor
+    // anchored to the same point on the obstacle throughout the drag.
+    const obstacleDragState = {
+      startX: 0,
+      startY: 0,
+      wasDrag: false,
+      offsetX: 0,
+      offsetY: 0,
+    }
+    const obstacleDrag = d3
+      .drag<SVGGElement, unknown>()
+      .on('start', function (event) {
+        obstacleDragState.startX = event.sourceEvent.clientX
+        obstacleDragState.startY = event.sourceEvent.clientY
+        obstacleDragState.wasDrag = false
+        const el = this as SVGGElement
+        const id = el.getAttribute('data-id')
+        const ob = id
+          ? obstaclesRef.current.find(o => o.id === id)
+          : undefined
+        if (ob) {
+          const p = toFieldM(event)
+          obstacleDragState.offsetX = p.x - ob.x
+          obstacleDragState.offsetY = p.y - ob.y
+        } else {
+          obstacleDragState.offsetX = 0
+          obstacleDragState.offsetY = 0
+        }
+        d3.select(this).raise()
+      })
+      .on('drag', function (event) {
+        const el = this as SVGGElement
+        const dx = event.sourceEvent.clientX - obstacleDragState.startX
+        const dy = event.sourceEvent.clientY - obstacleDragState.startY
+        if (Math.hypot(dx, dy) >= CLICK_DRAG_THRESHOLD_PX) {
+          obstacleDragState.wasDrag = true
+          d3.select(this).classed('dragging', true)
+        }
+        if (!obstacleDragState.wasDrag) return
+        const id = el.getAttribute('data-id')
+        if (!id) return
+        const p = toFieldM(event)
+        setObstacleOverrides(prev => ({
+          ...prev,
+          [id]: {
+            ...(prev[id] ?? {}),
+            x: p.x - obstacleDragState.offsetX,
+            y: p.y - obstacleDragState.offsetY,
+          },
+        }))
+      })
+      .on('end', function (event) {
+        d3.select(this).classed('dragging', false)
+        const el = this as SVGGElement
+        const id = el.getAttribute('data-id')
+        if (!id) return
+        if (!obstacleDragState.wasDrag) {
+          // Treat as click — select the obstacle so the inspector opens.
+          selectionApiRef.current.selectObstacle(id)
+          return
+        }
+        const p = toFieldM(event)
+        const finalX = p.x - obstacleDragState.offsetX
+        const finalY = p.y - obstacleDragState.offsetY
+        setObstacleOverrides(prev => {
+          const copy = { ...prev }
+          delete copy[id]
+          return copy
+        })
+        updateObstacleRef.current(id, { x: finalX, y: finalY })
+        // Keep the obstacle selected after a drag so the user can immediately
+        // tweak numeric fields in the inspector or drag the resize handle.
+        selectionApiRef.current.selectObstacle(id)
+      })
+    obstacleDragRef.current = obstacleDrag
+    svg.selectAll<SVGGElement, unknown>('g.obstacle-group').call(obstacleDrag)
+
+    // --- Obstacle resize (drag a handle on the circle edge) ---
+    //
+    // The handle is only rendered when the obstacle is selected; radius
+    // equals the cursor's distance from the obstacle centre, floored so a
+    // zero-radius circle can't be produced.
+    const obstacleResize = d3
+      .drag<SVGGElement, unknown>()
+      .on('start', function () {
+        d3.select(this).classed('dragging', true)
+      })
+      .on('drag', function (event) {
+        const el = this as SVGGElement
+        const id = el.getAttribute('data-id')
+        if (!id) return
+        const ob = obstaclesRef.current.find(o => o.id === id)
+        if (!ob) return
+        const p = toFieldM(event)
+        const dx = p.x - ob.x
+        const dy = p.y - ob.y
+        const r = Math.max(0.3, Math.sqrt(dx * dx + dy * dy))
+        setObstacleOverrides(prev => ({
+          ...prev,
+          [id]: { ...(prev[id] ?? {}), r },
+        }))
+      })
+      .on('end', function (event) {
+        d3.select(this).classed('dragging', false)
+        const el = this as SVGGElement
+        const id = el.getAttribute('data-id')
+        if (!id) return
+        const ob = obstaclesRef.current.find(o => o.id === id)
+        if (!ob) return
+        const p = toFieldM(event)
+        const dx = p.x - ob.x
+        const dy = p.y - ob.y
+        const r = Math.max(0.3, Math.sqrt(dx * dx + dy * dy))
+        setObstacleOverrides(prev => {
+          const copy = { ...prev }
+          delete copy[id]
+          return copy
+        })
+        updateObstacleRef.current(id, { r })
+      })
+    obstacleResizeRef.current = obstacleResize
+    svg.selectAll<SVGGElement, unknown>('g.obstacle-handle').call(obstacleResize)
+
     return () => {
       svg.on('.zoom', null)
       svg.selectAll<SVGGElement, unknown>('g.entity-group').on('.drag', null)
+      svg.selectAll<SVGGElement, unknown>('g.obstacle-group').on('.drag', null)
+      svg.selectAll<SVGGElement, unknown>('g.obstacle-handle').on('.drag', null)
       dragBehaviorRef.current = null
+      obstacleDragRef.current = null
+      obstacleResizeRef.current = null
+      zoomBehaviorRef.current = null
     }
   }, [])
 
@@ -306,6 +540,79 @@ export function GameView({
       .selectAll<SVGGElement, unknown>('g.entity-group')
       .call(dragBehaviorRef.current)
   }, [entityLabelsKey])
+
+  // Re-attach the obstacle drag + resize behaviours when an obstacle is
+  // added or removed. Both behaviours are stable (built once on mount); we
+  // just need to bind them to the freshly-rendered <g>'s on set changes.
+  // Position/radius edits keep the same <g> node so drag state survives.
+  useEffect(() => {
+    if (!svgRef.current) return
+    const svg = d3.select(svgRef.current)
+    if (obstacleDragRef.current) {
+      svg.selectAll<SVGGElement, unknown>('g.obstacle-group')
+        .call(obstacleDragRef.current)
+    }
+    if (obstacleResizeRef.current) {
+      svg.selectAll<SVGGElement, unknown>('g.obstacle-handle')
+        .call(obstacleResizeRef.current)
+    }
+  }, [obstacleIdsKey])
+
+  // Ensure the resize handle for the currently-selected obstacle is bound to
+  // the resize behaviour as soon as it renders (selection change mounts /
+  // unmounts the handle's <g> node).
+  const selectedObstacleId =
+    selectionApi.selection.kind === 'obstacle'
+      ? selectionApi.selection.id
+      : null
+  useEffect(() => {
+    if (!svgRef.current || !obstacleResizeRef.current) return
+    d3.select(svgRef.current)
+      .selectAll<SVGGElement, unknown>('g.obstacle-handle')
+      .call(obstacleResizeRef.current)
+  }, [selectedObstacleId])
+
+  // One-shot initial-fit: when entities first appear, center the entity
+  // bounding box in the canvas and scale to fit with some padding. Runs
+  // exactly once (latched via `hasFitInitialRef`) so subsequent spawns and
+  // re-renders don't yank the camera away from wherever the user has panned.
+  // Scale is clamped to the same [0.5, 3] range the d3-zoom behaviour uses,
+  // and the transform is applied via `zoomBehavior.transform` so the
+  // 'zoom' event fires and `transformRef.current` stays in sync.
+  useEffect(() => {
+    if (hasFitInitialRef.current) return
+    if (entities.length === 0) return
+    const svgEl = svgRef.current
+    const zoomBehavior = zoomBehaviorRef.current
+    if (!svgEl || !zoomBehavior) return
+    const rect = svgEl.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return
+
+    const xs = entities.map(e => toPxX(e.pos.x))
+    const ys = entities.map(e => toPxY(e.pos.y))
+    const PAD_PX = 80
+    const minX = Math.min(...xs) - PAD_PX
+    const maxX = Math.max(...xs) + PAD_PX
+    const minY = Math.min(...ys) - PAD_PX
+    const maxY = Math.max(...ys) + PAD_PX
+    const w = Math.max(maxX - minX, 1)
+    const h = Math.max(maxY - minY, 1)
+
+    const scale = Math.max(
+      0.5,
+      Math.min(3, Math.min(rect.width / w, rect.height / h)),
+    )
+    const cx = (minX + maxX) / 2
+    const cy = (minY + maxY) / 2
+    const tx = rect.width / 2 - cx * scale
+    const ty = rect.height / 2 - cy * scale
+
+    d3.select(svgEl).call(
+      zoomBehavior.transform,
+      d3.zoomIdentity.translate(tx, ty).scale(scale),
+    )
+    hasFitInitialRef.current = true
+  }, [entities])
 
   // --- Event-driven animations (moved from NetworkGraph) ---
   //
@@ -470,7 +777,17 @@ export function GameView({
     }
   }, [events])
 
-  const gradientId = `game-field-gradient-${activeGameId ?? 'none'}`
+  // Grid pattern ids — scoped per-mount so multiple GameView instances
+  // (hypothetically) don't collide in the SVG defs namespace.
+  const gridIdSuffix = useMemo(() => Math.random().toString(36).slice(2, 8), [])
+  const gridFineId = `grid-fine-${gridIdSuffix}`
+  const gridCoarseId = `grid-coarse-${gridIdSuffix}`
+
+  // Grid extent: a large rect inside the zoom layer makes the canvas feel
+  // "infinite" — the user can pan far in any direction before running off
+  // the grid. At PX_PER_M=20 this covers ±5000 metres from origin, which
+  // is well beyond any realistic navigation range.
+  const GRID_EXTENT_PX = 100_000
 
   // Look up the active game config for game-specific UI (timer, flag holder).
   const activeGame = useMemo<GameConfig | undefined>(() => {
@@ -478,87 +795,255 @@ export function GameView({
     return games.find(g => g.id === activeGameId)
   }, [games, activeGameId])
 
+  // HUD-source label (A2): selected node → its snapshot, otherwise fall back
+  // to the first node. Drives the canvas HUDs and the "HUD: …" pill.
+  const hudSourceLabel = selectHudSourceLabel(selectionApi.selection, nodes)
+  const hudSourceSnapshot = hudSourceLabel ? snapshots[hudSourceLabel] : undefined
+
+  // Edge hover state (A7). Tracked here so the HTML overlay can position the
+  // quick-toggle button at the edge midpoint without crossing the SVG/HTML
+  // boundary.
+  const [hoveredEdge, setHoveredEdge] = useState<{
+    a: string
+    b: string
+    mid: { x: number; y: number }
+  } | null>(null)
+
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between gap-3">
-          <CardTitle className="flex items-center gap-2">
-            Playing Field
-            {activeGameId ? (
-              <Badge variant="secondary">{activeGameId}</Badge>
-            ) : (
-              <Badge variant="outline">no game loaded</Badge>
-            )}
-            {/* CTF-style flag-holder pill — also works for any game whose
-                rules stamp `flag.holding_team`. */}
-            <FlagHolderBadge snapshots={snapshots} />
-          </CardTitle>
-          <div className="flex items-center gap-3">
-            <GameTimer snapshots={snapshots} durationS={activeGame?.duration_s} />
-            <Scoreboard snapshots={snapshots} />
-            <div className="text-xs text-muted-foreground">
-              {FIELD_WIDTH_M}m × {FIELD_HEIGHT_M}m · radius {commRadiusM}m · {entities.length}{' '}
-              {entities.length === 1 ? 'entity' : 'entities'}
-            </div>
+    <div className="flex flex-col h-full min-h-0">
+      {/* Canvas header strip: title + extracted HUDs. */}
+      <div className="shrink-0 border-b px-3 py-2 flex items-center gap-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Playing Field</span>
+          {activeGameId ? (
+            <Badge variant="secondary">{activeGameId}</Badge>
+          ) : (
+            <Badge variant="outline">no game loaded</Badge>
+          )}
+          <FlagHolderBadge
+            sourceSnapshot={hudSourceSnapshot}
+            allSnapshots={snapshots}
+          />
+        </div>
+        <div className="ml-auto flex items-center gap-3">
+          <GameTimer
+            sourceSnapshot={hudSourceSnapshot}
+            allSnapshots={snapshots}
+            activeGame={activeGame}
+          />
+          <Scoreboard
+            sourceSnapshot={hudSourceSnapshot}
+            allSnapshots={snapshots}
+          />
+          <div className="text-[10px] text-muted-foreground">
+            radius {commRadiusM}m · {entities.length}{' '}
+            {entities.length === 1 ? 'entity' : 'entities'}
           </div>
         </div>
-        <EndedBanner snapshots={snapshots} />
-      </CardHeader>
-      <CardContent className="overflow-x-auto">
-        <div className="relative inline-block" style={{ maxWidth: '100%' }}>
+      </div>
+
+      {/* Optional ended banner strip under the header. */}
+      <div className="shrink-0 px-3 py-1 empty:hidden">
+        <EndedBanner
+          sourceSnapshot={hudSourceSnapshot}
+          allSnapshots={snapshots}
+        />
+      </div>
+
+      {/* Canvas container: full-bleed SVG + HTML overlays (pill, hover
+          button, countdown). The canvas is infinite — the user pans/zooms
+          via d3-zoom rather than scrolling a bounded SVG. `overflow-hidden`
+          clips the huge grid rect to the container's rounded border. */}
+      <div className="flex-1 min-h-0 relative bg-background rounded-md border overflow-hidden">
         <svg
           ref={svgRef}
-          width={FIELD_WIDTH_PX}
-          height={FIELD_HEIGHT_PX}
-          viewBox={`0 0 ${FIELD_WIDTH_PX} ${FIELD_HEIGHT_PX}`}
-          className="bg-background rounded-md border"
-          style={{ maxWidth: '100%', height: 'auto' }}
+          width="100%"
+          height="100%"
+          className="block absolute inset-0"
+          onClick={e => {
+            // Background click → deselect. Entity/comm-edge/obstacle groups
+            // either stop propagation or (for obstacles) are handled by the
+            // d3-drag end callback that fires before this click — either way
+            // reaching here means the user clicked on the grid background.
+            const target = e.target as Element
+            if (
+              target.closest('.entity-group') ||
+              target.closest('.comm-edge') ||
+              target.closest('.obstacle-group') ||
+              target.closest('.obstacle-handle')
+            ) {
+              return
+            }
+            selectionApi.deselect()
+          }}
         >
           <defs>
-            <linearGradient
-              id={gradientId}
-              x1="0%"
-              y1="0%"
-              x2={presentation.gradient.angle === 0 ? '100%' : '0%'}
-              y2={presentation.gradient.angle === 0 ? '0%' : '100%'}
+            {/* 1 metre × 1 metre grid — thin, low-contrast. Tiled across a
+                large rect inside the zoom layer so grid spacing tracks world
+                metres under pan/zoom. `vector-effect: non-scaling-stroke`
+                keeps stroke width constant on screen regardless of zoom. */}
+            <pattern
+              id={gridFineId}
+              x={0}
+              y={0}
+              width={PX_PER_M}
+              height={PX_PER_M}
+              patternUnits="userSpaceOnUse"
             >
-              <stop offset="0%" stopColor={presentation.gradient.from} />
-              <stop offset="100%" stopColor={presentation.gradient.to} />
-            </linearGradient>
+              <path
+                d={`M ${PX_PER_M} 0 L 0 0 0 ${PX_PER_M}`}
+                fill="none"
+                stroke="#94a3b8"
+                strokeOpacity={0.18}
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+              />
+            </pattern>
+            {/* Every 10 metres — slightly thicker / more opaque, drawn on
+                top of the fine grid so the 10-m lines visually dominate. */}
+            <pattern
+              id={gridCoarseId}
+              x={0}
+              y={0}
+              width={PX_PER_M * 10}
+              height={PX_PER_M * 10}
+              patternUnits="userSpaceOnUse"
+            >
+              <path
+                d={`M ${PX_PER_M * 10} 0 L 0 0 0 ${PX_PER_M * 10}`}
+                fill="none"
+                stroke="#94a3b8"
+                strokeOpacity={0.45}
+                strokeWidth={1.5}
+                vectorEffect="non-scaling-stroke"
+              />
+            </pattern>
           </defs>
 
           {/* Zoom/pan transform applies to every field layer below. d3-zoom
               writes to `transform` on this group; see the effect above. */}
           <g ref={zoomLayerRef} className="zoom-layer">
-          {/* Field background */}
+          {/* Grid — drawn inside the zoom layer so 1 m spacing is preserved
+              in world coordinates (i.e., tiles scale with zoom). Two rects
+              layer the fine and coarse grids; the huge extent makes pan feel
+              unbounded. */}
           <rect
-            x={0}
-            y={0}
-            width={FIELD_WIDTH_PX}
-            height={FIELD_HEIGHT_PX}
-            fill={`url(#${gradientId})`}
+            x={-GRID_EXTENT_PX}
+            y={-GRID_EXTENT_PX}
+            width={GRID_EXTENT_PX * 2}
+            height={GRID_EXTENT_PX * 2}
+            fill={`url(#${gridFineId})`}
+          />
+          <rect
+            x={-GRID_EXTENT_PX}
+            y={-GRID_EXTENT_PX}
+            width={GRID_EXTENT_PX * 2}
+            height={GRID_EXTENT_PX * 2}
+            fill={`url(#${gridCoarseId})`}
           />
 
-          {/* Obstacles */}
+          {/* Obstacles — rendered from the user-managed ObstaclesContext.
+              Each obstacle sits in its own `g.obstacle-group` so the d3-drag
+              behaviour (installed in the mount effect) can pick it up by
+              `data-id`. Obstacles are clickable (select → inspector) and
+              draggable (reposition → updateObstacle). The selected obstacle
+              also renders a small square handle on its right edge that the
+              user drags to resize. */}
           <g className="obstacles">
-            {presentation.obstacles.map((o, i) => (
-              <circle
-                key={i}
-                cx={toPxX(o.x)}
-                cy={toPxY(o.y)}
-                r={o.r * PX_PER_M}
-                fill="#5b6470"
-                stroke="#2b323c"
-                strokeWidth={1.5}
-              />
-            ))}
+            {effectiveObstacles.map(o => {
+              const cx = toPxX(o.x)
+              const cy = toPxY(o.y)
+              const rPx = o.r * PX_PER_M
+              const selected = selectedObstacleId === o.id
+              const fill = o.blocks_los ? '#5b6470' : '#5b647080'
+              const stroke = selected ? 'var(--primary)' : '#2b323c'
+              const strokeWidth = selected ? 2.5 : 1.5
+              return (
+                <g
+                  key={o.id}
+                  className="obstacle-group"
+                  data-id={o.id}
+                  style={{ cursor: 'grab' }}
+                >
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={rPx}
+                    fill={fill}
+                    stroke={stroke}
+                    strokeWidth={strokeWidth}
+                    strokeDasharray={o.blocks_los ? undefined : '4,3'}
+                  />
+                  {/* Tiny label, shown faintly so obstacles are identifiable
+                      at a glance but don't compete with entity labels. */}
+                  <text
+                    x={cx}
+                    y={cy + rPx + 12}
+                    textAnchor="middle"
+                    fontSize={10}
+                    fill={selected ? 'var(--primary)' : '#94a3b8'}
+                    style={{ pointerEvents: 'none', userSelect: 'none' }}
+                  >
+                    {o.label}
+                  </text>
+                </g>
+              )
+            })}
           </g>
 
-          {/* Comm-radius rings */}
+          {/* Obstacle resize handle — rendered separately (above obstacles)
+              for the selected obstacle only. Sits on its own `g` so the
+              resize-drag behaviour can find it by class + data-id. */}
+          {selectedObstacleId && (() => {
+            const o = effectiveObstacles.find(ob => ob.id === selectedObstacleId)
+            if (!o) return null
+            const cx = toPxX(o.x)
+            const cy = toPxY(o.y)
+            const rPx = o.r * PX_PER_M
+            return (
+              <g
+                className="obstacle-handle"
+                data-id={o.id}
+                style={{ cursor: 'ew-resize' }}
+              >
+                {/* Thin indicator line from centre to handle so the user
+                    can see they're editing the radius. */}
+                <line
+                  x1={cx}
+                  y1={cy}
+                  x2={cx + rPx}
+                  y2={cy}
+                  stroke="var(--primary)"
+                  strokeWidth={1}
+                  strokeOpacity={0.5}
+                  strokeDasharray="3,3"
+                  pointerEvents="none"
+                />
+                <rect
+                  x={cx + rPx - 5}
+                  y={cy - 5}
+                  width={10}
+                  height={10}
+                  rx={2}
+                  fill="var(--primary)"
+                  stroke="#0f172a"
+                  strokeWidth={1}
+                />
+              </g>
+            )
+          })()}
+
+          {/* Comm-radius rings. The selected node's ring renders with a
+              much higher opacity so it's obvious which node's range is
+              highlighted; the remaining rings stay faint so they don't
+              clutter the canvas. */}
           <g className="radius-rings">
             {entities.map(e => {
               const p = effectivePos[e.label]
               if (!p) return null
+              const selected =
+                selectionApi.selection.kind === 'node' &&
+                selectionApi.selection.label === e.label
               return (
                 <circle
                   key={e.label}
@@ -567,7 +1052,8 @@ export function GameView({
                   r={commRadiusM * PX_PER_M}
                   fill="none"
                   stroke="#64748b"
-                  strokeOpacity={0.12}
+                  strokeOpacity={selected ? 0.75 : 0.08}
+                  strokeWidth={selected ? 1.5 : 1}
                   strokeDasharray="2,4"
                 />
               )
@@ -577,7 +1063,10 @@ export function GameView({
           {/* Comm edges — one line per pair. Connected pairs are green; every
               other pair (out of range, obstructed, or user-severed) renders as
               a red dashed line with higher opacity. A wider transparent line
-              sits on top so the edge is easy to click. */}
+              sits on top so the edge is easy to click. Clicking the line
+              selects the edge (A7); the partition toggle itself lives in the
+              EdgeInspector (Phase 4/5). The `EdgeHoverToggle` overlay on top
+              of this layer surfaces a quick-toggle button on hover. */}
           <g className="comm-edges">
             {commEdges.map(edge => {
               const pa = effectivePos[edge.a]
@@ -590,12 +1079,44 @@ export function GameView({
               const stroke = edge.connected ? '#22c55e' : '#ef4444'
               const strokeOpacity = edge.connected ? 0.55 : 0.85
               const strokeWidth = edge.connected ? 1.4 : 2
+              const selected =
+                selectionApi.selection.kind === 'edge' &&
+                edgeKey(edge.a, edge.b) === edgeKey(
+                  selectionApi.selection.a,
+                  selectionApi.selection.b,
+                )
+              const midX = (x1 + x2) / 2
+              const midY = (y1 + y2) / 2
               return (
                 <g
                   key={`${edge.a}-${edge.b}`}
                   className="comm-edge"
                   style={{ cursor: 'pointer' }}
-                  onClick={() => onTogglePartition(edge.a, edge.b)}
+                  onClick={e => {
+                    e.stopPropagation()
+                    selectionApi.selectEdge(edge.a, edge.b)
+                  }}
+                  onMouseEnter={() => {
+                    // Convert viewBox coords to container pixels for the
+                    // HTML overlay. The zoom layer's transform applies on the
+                    // client side; `getScreenCTM` would be the correct way to
+                    // project, but for the container-relative midpoint we
+                    // combine the current zoom transform with the SVG size
+                    // ratio (SVG is rendered at its intrinsic size since the
+                    // container scrolls rather than scales).
+                    const { k, x, y } = transformRef.current
+                    setHoveredEdge({
+                      a: edge.a,
+                      b: edge.b,
+                      mid: { x: midX * k + x, y: midY * k + y },
+                    })
+                  }}
+                  onMouseLeave={() => {
+                    // Let EdgeHoverToggle's own hide-delay take over. Setting
+                    // null arms its timer; if the cursor moves onto the
+                    // button itself it keeps the toggle visible.
+                    setHoveredEdge(null)
+                  }}
                 >
                   <line
                     x1={x1}
@@ -603,21 +1124,22 @@ export function GameView({
                     x2={x2}
                     y2={y2}
                     stroke={stroke}
-                    strokeOpacity={strokeOpacity}
-                    strokeWidth={strokeWidth}
+                    strokeOpacity={selected ? 1 : strokeOpacity}
+                    strokeWidth={selected ? strokeWidth + 1.5 : strokeWidth}
                     strokeDasharray="6,4"
                   />
                   {/* Invisible wider hit target — makes thin lines easy to
                       tap without dominating the visual. `pointerEvents="stroke"`
                       guarantees the line catches clicks even though the stroke
-                      is transparent. */}
+                      is transparent. Widened to 20px (A7) so hover/click is
+                      easy. */}
                   <line
                     x1={x1}
                     y1={y1}
                     x2={x2}
                     y2={y2}
                     stroke="transparent"
-                    strokeWidth={14}
+                    strokeWidth={20}
                     pointerEvents="stroke"
                   />
                 </g>
@@ -628,6 +1150,16 @@ export function GameView({
           {/* Effects layer (heartbeat/action/state animations) sits above the
               edges and behind the entities so pulses don't hide the glyphs. */}
           <g ref={effectsLayerRef} className="effects-layer" pointerEvents="none" />
+
+          {/* Selection ring sits above effects, below entity glyphs. Rendered
+              inside the zoom layer so the ring pans + zooms with the field. */}
+          {selectionApi.selection.kind === 'node' && (() => {
+            const p = effectivePos[selectionApi.selection.label]
+            if (!p) return null
+            return (
+              <SelectionRing x={toPxX(p.x)} y={toPxY(p.y)} />
+            )
+          })()}
 
           {/* Entities */}
           <g className="entities">
@@ -646,347 +1178,32 @@ export function GameView({
             })}
           </g>
           </g>
+          {/* Background-click deselect layer. A transparent rect inside the
+              zoom layer would hijack drag/zoom, so we put a top-level
+              invisible overlay on the SVG root and check that the click
+              originated directly on the SVG background (not bubbled from an
+              entity or edge group). */}
         </svg>
-        <CountdownOverlay snapshots={snapshots} />
+
+        {/* HTML overlays pinned to the canvas container. `absolute` +
+            `inset-0` stacks on top of the SVG but shares the same sizing. */}
+        <div className="pointer-events-none absolute inset-0">
+          <CanvasHudSourceIndicator />
+          <CountdownOverlay allSnapshots={snapshots} />
+          <EdgeHoverToggle
+            hovered={hoveredEdge}
+            partitioned={
+              hoveredEdge
+                ? partitions.some(
+                    p => edgeKey(p[0], p[1]) === edgeKey(hoveredEdge.a, hoveredEdge.b),
+                  )
+                : false
+            }
+            onToggle={(a, b) => onTogglePartitionRef.current(a, b)}
+            onHoverEnd={() => setHoveredEdge(null)}
+          />
         </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-// --- Scoreboard (visible once any node has scores) ---
-//
-// Each node maintains its own `scores: Record<team, number>` in its snapshot.
-// Because every node applies IncrementScore on the same consensus-ordered
-// delta, values converge; we merge across snapshots by taking the max per
-// team to tolerate transient lag while nodes are catching up.
-function Scoreboard({
-  snapshots,
-}: {
-  snapshots: Record<string, LocalGameSnapshot>
-}) {
-  const merged = useMemo(() => {
-    const out: Record<string, number> = {}
-    for (const snap of Object.values(snapshots)) {
-      for (const [team, score] of Object.entries(snap.scores ?? {})) {
-        // Skip internal bookkeeping keys (like __countdown_start_ms).
-        if (team.startsWith('__')) continue
-        const n = typeof score === 'number' ? score : 0
-        if (n > (out[team] ?? -Infinity)) out[team] = n
-      }
-    }
-    return out
-  }, [snapshots])
-
-  const teams = Object.keys(merged).sort()
-  if (teams.length === 0) return null
-
-  return (
-    <div className="flex items-center gap-1.5">
-      {teams.map(team => (
-        <span
-          key={team}
-          className="font-mono text-xs font-semibold px-1.5 py-0.5 rounded"
-          title={`${team} hold time: ${formatMmSs(merged[team])}`}
-          style={{
-            backgroundColor: teamColor(team) + '22',
-            color: teamColor(team),
-            border: `1px solid ${teamColor(team)}55`,
-          }}
-        >
-          {team}: {formatMmSs(merged[team])}
-        </span>
-      ))}
-    </div>
-  )
-}
-
-// --- Game timer (MM:SS) ---
-//
-// The backend pins `countdown_zero_ns` to the consensus timestamp of the final
-// `ReadyUp`, then `CountingDown → Playing` flips 3s later. Gameplay therefore
-// starts at `countdown_zero_ns + 3s` on every node, so we can derive an
-// MM:SS countdown purely from the snapshot stream. When `duration_s` is unset
-// we render an elapsed-since-start timer instead so every game still surfaces
-// a running clock.
-function GameTimer({
-  snapshots,
-  durationS,
-}: {
-  snapshots: Record<string, LocalGameSnapshot>
-  durationS?: number
-}) {
-  const [now, setNow] = useState(() => Date.now())
-
-  const phases = useMemo(() => Object.values(snapshots).map(s => s.phase), [snapshots])
-  const anyPlaying = phases.some(p => p === 'playing')
-  const anyEnded = phases.some(p => p === 'ended')
-  const live = anyPlaying || anyEnded
-  useEffect(() => {
-    if (!live) return
-    const id = window.setInterval(() => setNow(Date.now()), 250)
-    return () => window.clearInterval(id)
-  }, [live])
-
-  // countdown_zero_ns is nanoseconds since UNIX epoch. Play starts 3s later.
-  const startMs = useMemo(() => {
-    for (const snap of Object.values(snapshots)) {
-      if (snap.countdown_zero_ns != null) {
-        const zeroMs = Math.floor(snap.countdown_zero_ns / 1_000_000)
-        return zeroMs + 3_000
-      }
-    }
-    return null
-  }, [snapshots])
-
-  if (!live || startMs == null) return null
-
-  const elapsedMs = Math.max(0, now - startMs)
-  if (durationS != null) {
-    const remainingMs = Math.max(0, durationS * 1000 - elapsedMs)
-    const critical = remainingMs <= 30_000
-    const color = anyEnded
-      ? 'text-purple-300 border-purple-400/40 bg-purple-500/10'
-      : critical
-        ? 'text-amber-300 border-amber-400/50 bg-amber-500/10'
-        : 'text-emerald-300 border-emerald-400/40 bg-emerald-500/10'
-    return (
-      <span
-        className={`font-mono text-xs font-semibold px-2 py-0.5 rounded border ${color} ${critical && !anyEnded ? 'animate-pulse' : ''}`}
-        title={
-          anyEnded
-            ? 'Game ended'
-            : `Time remaining · game ends at ${new Date(startMs + durationS * 1000).toLocaleTimeString()}`
-        }
-      >
-        ⏱ {formatMmSs(Math.ceil(remainingMs / 1000))}
-      </span>
-    )
-  }
-
-  // No duration configured — show elapsed as a neutral pill.
-  return (
-    <span
-      className="font-mono text-xs font-semibold px-2 py-0.5 rounded border border-slate-500/40 bg-slate-500/10 text-slate-200"
-      title="Elapsed play time"
-    >
-      ⏱ {formatMmSs(Math.floor(elapsedMs / 1000))}
-    </span>
-  )
-}
-
-// --- Flag-holder pill ---
-//
-// Reads `entities.<flag>.properties.holding_team` from any converged snapshot.
-// The CTF `mark_holding` rule stamps it once the flag has sat at a base for
-// 1s; it persists as "last holder" until another base takes possession. We
-// also cross-check the proximity_tracker to label "currently at base" vs
-// "last held by" so the UI tells the truth when the flag is in transit.
-function FlagHolderBadge({
-  snapshots,
-}: {
-  snapshots: Record<string, LocalGameSnapshot>
-}) {
-  const snap = Object.values(snapshots).find(s => s.active_game_id) ?? null
-  if (!snap) return null
-
-  // Find the flag entity (game-agnostic — any entity whose type is 'flag').
-  const flagEntity = Object.values(snap.entities).find(e => e.entity_type === 'flag')
-  if (!flagEntity) return null
-
-  const holdingTeam = (flagEntity.properties?.holding_team as string | undefined) ?? null
-
-  // Is the flag currently within 1m of *a* base? We can tell from the
-  // proximity_tracker — `mark_holding`'s rule-scoped key is `mark_holding|<flag>|<base>`
-  // and is present iff the pair is currently within range.
-  const tracker = snap.proximity_tracker ?? {}
-  const flagLabel = flagEntity.label
-  const activelyHeld = Object.keys(tracker).some(key => {
-    if (!key.startsWith('mark_holding|')) return false
-    return key.includes(`|${flagLabel}|`) || key.endsWith(`|${flagLabel}`)
-  })
-
-  if (!holdingTeam && !activelyHeld) {
-    return (
-      <Badge
-        variant="outline"
-        className="text-[10px] font-mono border-slate-500/40 bg-slate-500/10 text-slate-200"
-        title="Flag has not been captured yet"
-      >
-        🚩 neutral
-      </Badge>
-    )
-  }
-
-  const color = holdingTeam ? teamColor(holdingTeam) : '#94a3b8'
-  return (
-    <Badge
-      variant="outline"
-      className="text-[10px] font-mono"
-      style={{
-        backgroundColor: color + '22',
-        color,
-        borderColor: color + '55',
-      }}
-      title={
-        activelyHeld
-          ? `Flag is at ${holdingTeam ?? 'a'} base`
-          : `Flag last captured by ${holdingTeam ?? 'unknown'}; currently in transit`
-      }
-    >
-      🚩 {activelyHeld ? `at ${holdingTeam ?? '?'} base` : `last held by ${holdingTeam ?? '?'}`}
-    </Badge>
-  )
-}
-
-// --- Ended banner (winner + reason) ---
-//
-// When any node's phase flips to `ended`, surface the winner_team and reason
-// captured from the GameEnd payload. Renders below the header row so the
-// playing field stays unobstructed.
-function EndedBanner({
-  snapshots,
-}: {
-  snapshots: Record<string, LocalGameSnapshot>
-}) {
-  const ended = useMemo(() => {
-    for (const snap of Object.values(snapshots)) {
-      if (snap.phase !== 'ended') continue
-      return {
-        winner: snap.ended_winner_team ?? null,
-        reason: snap.ended_reason ?? null,
-      }
-    }
-    return null
-  }, [snapshots])
-
-  if (!ended) return null
-
-  return (
-    <div className="mt-2 flex items-center gap-2 text-xs rounded border border-purple-500/40 bg-purple-500/10 text-purple-200 px-2 py-1">
-      <span className="font-semibold uppercase tracking-wide">Game ended</span>
-      {ended.winner ? (
-        <span
-          className="px-1.5 py-0.5 rounded font-mono font-semibold"
-          style={{
-            backgroundColor: teamColor(ended.winner) + '22',
-            color: teamColor(ended.winner),
-            border: `1px solid ${teamColor(ended.winner)}55`,
-          }}
-        >
-          winner: {ended.winner}
-        </span>
-      ) : (
-        <span className="px-1.5 py-0.5 rounded font-mono font-semibold bg-slate-500/20 text-slate-200 border border-slate-500/40">
-          draw
-        </span>
-      )}
-      {ended.reason && <span className="text-[11px] italic truncate">{ended.reason}</span>}
-    </div>
-  )
-}
-
-/** Format a non-negative number of seconds as `MM:SS`. */
-function formatMmSs(totalSeconds: number): string {
-  const s = Math.max(0, Math.floor(totalSeconds))
-  const mm = Math.floor(s / 60)
-    .toString()
-    .padStart(2, '0')
-  const ss = (s % 60).toString().padStart(2, '0')
-  return `${mm}:${ss}`
-}
-
-// --- Synchronised 3-2-1-GO countdown overlay ---
-//
-// Backend sets `countdown_zero_ns` to the Vertex consensus timestamp of the
-// final ReadyUp on every node simultaneously, then transitions each local
-// phase through CountingDown → Playing after 3s of wall-clock. The overlay
-// here reads the collective phase state: if *any* snapshot reports
-// counting_down, start showing the countdown using a locally-captured t0;
-// when phases flip to playing, briefly show "GO!" then fade out.
-function CountdownOverlay({
-  snapshots,
-}: {
-  snapshots: Record<string, LocalGameSnapshot>
-}) {
-  const [now, setNow] = useState(() => Date.now())
-  const t0Ref = useRef<number | null>(null)
-  const playingAtRef = useRef<number | null>(null)
-
-  const phases = useMemo(() => Object.values(snapshots).map(s => s.phase), [snapshots])
-  const anyCountingDown = phases.some(p => p === 'counting_down')
-  const anyPlaying = phases.some(p => p === 'playing')
-
-  // Capture t0 on the first tick we observe counting_down.
-  useEffect(() => {
-    if (anyCountingDown && t0Ref.current == null) {
-      t0Ref.current = Date.now()
-    }
-  }, [anyCountingDown])
-
-  // Capture transition to playing to drive the "GO!" flash.
-  useEffect(() => {
-    if (anyPlaying && playingAtRef.current == null) {
-      playingAtRef.current = Date.now()
-    }
-  }, [anyPlaying])
-
-  // Reset when nobody is counting down or playing anymore.
-  useEffect(() => {
-    if (!anyCountingDown && !anyPlaying) {
-      t0Ref.current = null
-      playingAtRef.current = null
-    }
-  }, [anyCountingDown, anyPlaying])
-
-  // Tick at ~60Hz while the overlay is live so the count re-renders.
-  useEffect(() => {
-    if (!anyCountingDown && !anyPlaying) return
-    const id = window.setInterval(() => setNow(Date.now()), 60)
-    return () => window.clearInterval(id)
-  }, [anyCountingDown, anyPlaying])
-
-  const t0 = t0Ref.current
-  const playingAt = playingAtRef.current
-
-  let content: { text: string; accent: string } | null = null
-  if (t0 != null) {
-    const elapsedMs = now - t0
-    const secsLeft = Math.ceil((3000 - elapsedMs) / 1000)
-    if (secsLeft > 0 && secsLeft <= 3) {
-      content = { text: String(secsLeft), accent: 'text-amber-300' }
-    }
-  }
-  // "GO!" takes priority once any node transitions to playing, for ~1s.
-  if (playingAt != null && now - playingAt < 1200) {
-    content = { text: 'GO!', accent: 'text-emerald-300' }
-  }
-
-  if (!content) return null
-
-  return (
-    <div
-      className="pointer-events-none absolute inset-0 flex items-center justify-center"
-      aria-live="polite"
-    >
-      <div
-        className={`font-black ${content.accent} drop-shadow-[0_6px_24px_rgba(0,0,0,0.8)]`}
-        style={{
-          fontSize: '180px',
-          letterSpacing: '-0.05em',
-          textShadow: '0 0 32px currentColor, 0 2px 8px rgba(0,0,0,0.6)',
-          animation: 'countdown-pulse 0.9s ease-out',
-        }}
-      >
-        {content.text}
       </div>
-      <style>{`
-        @keyframes countdown-pulse {
-          0% { transform: scale(1.6); opacity: 0; }
-          40% { transform: scale(1); opacity: 1; }
-          100% { transform: scale(1); opacity: 1; }
-        }
-      `}</style>
     </div>
   )
 }

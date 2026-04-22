@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -193,35 +194,64 @@ pub async fn run(
 
     let games = Arc::new(games);
 
-    tokio::select! {
-        r = engine_loop(
-            engine,
-            runtime.clone(),
-            proof_dir,
-            tx_req_receiver,
-            tx_req_sender.clone(),
-            games.clone(),
-            swarm_size,
-        ) => r?,
-        r = control_loop(
-            runtime.clone(),
-            cmd_rx,
-            tx_req_sender,
-            games.clone(),
-            swarm_size,
-        ) => r?,
-        _ = tokio::signal::ctrl_c() => {
-            log("SHUTDOWN", &runtime.lock().unwrap().label, "received signal");
-        }
-    };
+    // Run the engine-bound tasks inside a LocalSet. The Engine and Message
+    // types from tashi-vertex are !Send (they wrap NonNull<T>), so we can't
+    // hand them to tokio::spawn on the multi-threaded runtime. A LocalSet
+    // runs spawn_local tasks on the current thread and lets us share the
+    // engine as Rc<Engine> between the recv task and the main loop.
+    //
+    // Why a recv task at all: tashi-vertex 0.13.0's `recv_message` future is
+    // not cancellation-safe — dropping it mid-poll triggers a use-after-free
+    // inside the C library. A dedicated recv task in a plain loop (no
+    // select!) guarantees each future is awaited to completion, which lets
+    // the main engine_loop use tokio::select! freely on cancel-safe mpsc
+    // channels. See TASHI_VERTEX_RECV_CANCEL_BUG.md for the gory details.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let engine = Rc::new(engine);
+            tokio::select! {
+                r = engine_loop(
+                    engine.clone(),
+                    runtime.clone(),
+                    proof_dir,
+                    tx_req_receiver,
+                    tx_req_sender.clone(),
+                    games.clone(),
+                    swarm_size,
+                ) => r?,
+                r = control_loop(
+                    runtime.clone(),
+                    cmd_rx,
+                    tx_req_sender,
+                    games.clone(),
+                    swarm_size,
+                ) => r?,
+                _ = tokio::signal::ctrl_c() => {
+                    log("SHUTDOWN", &runtime.lock().unwrap().label, "received signal");
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
 
     Ok(())
 }
 
-// --- Single engine loop: all Engine access happens here ---
+// --- Main engine loop: consumes consensus messages + outbound tx requests ---
+//
+// Architecture: a dedicated spawn_local task owns `recv_message` polling and
+// forwards results through an mpsc channel. The main loop below `select!`s on
+// that channel + the tx-request channel. Both are mpsc receivers, which are
+// documented cancel-safe — so the main loop can freely use tokio::select!
+// concurrency without ever cancelling a `recv_message` future mid-poll.
+//
+// This structure sidesteps the tashi-vertex 0.13.0 use-after-free: the only
+// code path that awaits recv_message is the recv task, which runs the future
+// to completion in a plain loop (no select!). See TASHI_VERTEX_RECV_CANCEL_BUG.md.
 
 async fn engine_loop(
-    engine: Engine,
+    engine: Rc<Engine>,
     runtime: SharedRuntime,
     proof_dir: Option<PathBuf>,
     mut tx_req_rx: mpsc::UnboundedReceiver<TxRequest>,
@@ -234,13 +264,44 @@ async fn engine_loop(
     // Send the hello on first sync point
     let mut hello_sent = false;
 
+    // Dedicated recv task: runs recv_message to completion every iteration
+    // and forwards the result via mpsc. The future is never dropped mid-poll
+    // because this task does not use select!.
+    let (msg_tx, mut msg_rx) =
+        mpsc::unbounded_channel::<tashi_vertex::Result<Option<Message>>>();
+    let engine_for_recv = engine.clone();
+    let _recv_handle = tokio::task::spawn_local(async move {
+        loop {
+            let result = engine_for_recv.recv_message().await;
+            let terminal = !matches!(&result, Ok(Some(_)));
+            if msg_tx.send(result).is_err() {
+                break;
+            }
+            if terminal {
+                break;
+            }
+        }
+    });
+
     loop {
         tokio::select! {
+            // Both arms select on mpsc receivers — cancel-safe by tokio's
+            // contract, so the losing arm's future is safely dropped on the
+            // next iteration without any C-side state at risk.
             Some(req) = tx_req_rx.recv() => {
                 process_tx_request(&engine, &runtime, req);
             }
-            result = engine.recv_message() => {
-                match &result {
+            maybe = msg_rx.recv() => {
+                let result = match maybe {
+                    Some(r) => r,
+                    None => {
+                        let label = runtime.lock().unwrap().label.clone();
+                        log("ENGINE_CLOSED", &label, "recv task channel closed");
+                        return Ok(());
+                    }
+                };
+                let message = match result {
+                    Ok(Some(m)) => m,
                     Ok(None) => {
                         let label = runtime.lock().unwrap().label.clone();
                         log("ENGINE_CLOSED", &label, "recv_message returned None - engine shut down");
@@ -251,9 +312,7 @@ async fn engine_loop(
                         log("RECV_ERR", &label, format!("recv_message error: {e:#}"));
                         anyhow::bail!("recv_message error: {e:#}");
                     }
-                    Ok(Some(_)) => {}
-                }
-                let message = result.unwrap().unwrap();
+                };
 
                 match message {
                     Message::SyncPoint(_) => {

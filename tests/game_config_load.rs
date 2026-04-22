@@ -111,6 +111,7 @@ fn loader_rejects_empty_id() {
             placement: vec![],
             rules: vec![],
             duration_s: None,
+            obstacles: vec![],
         })
         .unwrap(),
     )

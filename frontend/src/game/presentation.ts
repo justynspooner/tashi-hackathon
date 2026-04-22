@@ -1,19 +1,18 @@
-// Visual/field configuration. This file is the single source of truth for
-// playing-field dimensions and obstacle placement — the Rust backend does not
-// know about either (obstacles are a rendering concern; field dimensions are
-// duplicated as one-line constants in `src/defaults.rs`).
+// Visual/field configuration. The playing field is an infinite canvas — the
+// frontend has no bounded "field" to speak of. This module owns the pixels-
+// per-metre scale used by every canvas helper and per-game theming. Obstacles
+// are a pure rendering concern (the Rust backend does not know about them)
+// and are owned by the `ObstaclesContext` — the user adds / positions /
+// resizes them manually via the scene tree + canvas.
 
-import type { Position } from './types'
-
-export const FIELD_WIDTH_M = 60
-export const FIELD_HEIGHT_M = 30
 export const PX_PER_M = 20
-
-export const FIELD_WIDTH_PX = FIELD_WIDTH_M * PX_PER_M
-export const FIELD_HEIGHT_PX = FIELD_HEIGHT_M * PX_PER_M
 
 export const COMM_RADIUS_M = 15
 
+/** Shape used by the frontend LOS check. The obstacle state in
+ *  `ObstaclesContext` is a superset (it also carries an id + label) — this is
+ *  the structural minimum `hasLos` needs so the geometry helper stays free of
+ *  UI concerns. */
 export interface Obstacle {
   x: number
   y: number
@@ -22,38 +21,17 @@ export interface Obstacle {
 }
 
 export interface GamePresentation {
-  gradient: { from: string; to: string; angle?: number }
-  obstacles: Obstacle[]
+  // Reserved for future per-game visuals (colour palette, background art,
+  // etc.). Presentations used to inline default obstacles here; obstacle
+  // placement now belongs to the user, not the game config.
+  _placeholder?: never
 }
 
 export const PRESENTATIONS: Record<string, GamePresentation> = {
-  // No game loaded — neutral grey field.
-  no_game: {
-    gradient: { from: '#1f2530', to: '#141820' },
-    obstacles: [],
-  },
-
-  ctf: {
-    gradient: { from: '#3b1818', to: '#18273b', angle: 0 },
-    obstacles: [
-      { x: 20, y: 10, r: 1.8, blocks_los: true },
-      { x: 40, y: 20, r: 2.2, blocks_los: true },
-      { x: 30, y: 15, r: 1.5, blocks_los: true },
-    ],
-  },
-
-  king_of_the_hill: {
-    gradient: { from: '#1d2a1d', to: '#0f170f' },
-    obstacles: [],
-  },
-
-  territory: {
-    gradient: { from: '#1a1c2e', to: '#101022' },
-    obstacles: [
-      { x: 15, y: 8, r: 1.6, blocks_los: true },
-      { x: 45, y: 22, r: 1.6, blocks_los: true },
-    ],
-  },
+  no_game: {},
+  ctf: {},
+  king_of_the_hill: {},
+  territory: {},
 }
 
 export function presentationFor(gameId: string | null | undefined): GamePresentation {
@@ -87,9 +65,3 @@ export function fromPxY(yPx: number): number {
   return yPx / PX_PER_M
 }
 
-export function clampToField(p: Position): Position {
-  return {
-    x: Math.min(Math.max(p.x, 0), FIELD_WIDTH_M),
-    y: Math.min(Math.max(p.y, 0), FIELD_HEIGHT_M),
-  }
-}
