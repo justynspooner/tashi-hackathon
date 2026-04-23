@@ -34,12 +34,17 @@ import type { EntityRecord, GameConfig, LocalGameSnapshot } from '@/game/types'
 import { teamColor } from '@/game/presentation'
 import {
   HIDDEN_PROPERTY_KEYS,
+  claimTeamFor,
   closestEntityOfType,
   countClaims,
+  decayRemainingMs,
   entityGlyph,
+  extractDecayRules,
   extractProximityRules,
   formatMmSs,
+  hasScoreEffects,
   proximityKey,
+  teamsForCardinality,
   visibleScoreTeams,
 } from '@/lib/node-control-helpers'
 
@@ -65,7 +70,11 @@ export function EntityComponent({
   const hasClaimed = !!myEntity?.entity_type
 
   // Before a game is loaded (or during proposal/vote), there's nothing for
-  // this component to render.
+  // this component to render. The post-game `GameEndedActions` panel lives
+  // alongside this in `NodeInspector` — it has its own visibility logic that
+  // spans `ended → proposing → voting`, which is why we don't fold it in
+  // here anymore (the runtime body / claim form / ready-up UI all want to
+  // stay hidden during a vote, but the post-game picker doesn't).
   if (!activeGame || phase === 'no_game' || phase === 'proposing' || phase === 'voting') {
     return null
   }
@@ -128,13 +137,26 @@ function ClaimForm({
   }
 
   const selectedTypeDef = activeGame.entity_types.find(t => t.id === selectedType)
-  const needsTeam = selectedTypeDef?.team === 'per_team'
-  const teamOptions: Array<string | null> = needsTeam ? activeGame.teams : [null]
+  // Only `per_team` surfaces a team picker in the UI. Teamless entities send
+  // `null`; fixed-team entities (e.g. freeze_tag's `freezer` → `'freezers'`)
+  // don't need a picker but *do* need their fixed team in the claim payload —
+  // see `claimTeamFor` and the backend's `reject_for_cardinality`.
+  const needsTeamPicker = selectedTypeDef?.team === 'per_team'
+  const fixedTeam =
+    selectedTypeDef && selectedTypeDef.team && selectedTypeDef.team !== 'per_team'
+      ? selectedTypeDef.team
+      : null
+  const teamOptions: Array<string | null> = needsTeamPicker ? activeGame.teams : [null]
 
   const isTypeExhausted = (typeId: string): boolean => {
     const td = activeGame.entity_types.find(t => t.id === typeId)
     if (!td) return true
-    const teams: Array<string | null> = td.team === 'per_team' ? activeGame.teams : [null]
+    // Count against every slot this type occupies — `[null]` for teamless,
+    // every team for `per_team`, or the one fixed team for fixed-team types.
+    // Using a bare `[null]` here used to hide full-capacity for fixed-team
+    // entities because claims are stored with their fixed team string, not
+    // null.
+    const teams = teamsForCardinality(td.team, activeGame.teams)
     return teams.every(t => countClaims(canonicalEntities, typeId, t, myPeerId) >= td.max)
   }
 
@@ -145,11 +167,15 @@ function ClaimForm({
   }
 
   async function handleClaim() {
-    if (!selectedType) return
-    if (needsTeam && !selectedTeam) return
+    if (!selectedType || !selectedTypeDef) return
+    if (needsTeamPicker && !selectedTeam) return
     setClaiming(true)
     try {
-      await onClaimEntity(node.label, selectedType, needsTeam ? selectedTeam : null)
+      await onClaimEntity(
+        node.label,
+        selectedType,
+        claimTeamFor(selectedTypeDef.team, selectedTeam),
+      )
     } finally {
       setClaiming(false)
     }
@@ -187,7 +213,7 @@ function ClaimForm({
             })}
           </SelectContent>
         </Select>
-        {needsTeam && (
+        {needsTeamPicker && (
           <Select value={selectedTeam} onValueChange={v => setSelectedTeam(v ?? '')}>
             <SelectTrigger size="sm" className="h-7 text-[11px] flex-1 px-2">
               <SelectValue placeholder="team" />
@@ -209,11 +235,23 @@ function ClaimForm({
             </SelectContent>
           </Select>
         )}
+        {fixedTeam && (
+          // Fixed-team entities (e.g. freeze_tag `freezer`) have a pre-assigned
+          // team — show it so the user knows what they're claiming.
+          <div className="flex-1 flex items-center justify-center h-7">
+            <span
+              className="px-1.5 rounded text-[10px] font-semibold"
+              style={{ backgroundColor: teamColor(fixedTeam) + '30', color: teamColor(fixedTeam) }}
+            >
+              {fixedTeam}
+            </span>
+          </div>
+        )}
       </div>
       <Button
         size="sm"
         className="h-7 text-[11px] w-full"
-        disabled={claiming || !selectedType || (needsTeam && !selectedTeam)}
+        disabled={claiming || !selectedType || (needsTeamPicker && !selectedTeam)}
         onClick={handleClaim}
       >
         {claiming ? 'Claiming…' : 'Claim'}
@@ -383,10 +421,37 @@ function NodeGameRuntimeBody({
     propertyRows.push({ key, value, highlightTeam: key.endsWith('team') })
   }
 
+  // eslint-disable-next-line react-hooks/purity -- 4Hz tick pattern (see comment above nowMs)
+  const now = Date.now()
+
+  // Decay timers (e.g. freeze_tag's 30-second `frozen_since_ms` window). When
+  // the rule that produces the timer is currently "blocked" by its own guard,
+  // we suppress the matching proximity bar — once a runner is frozen, the
+  // freezer's 2-second proximity progress is moot until the 30s window
+  // expires. Surfaced as countdown chips in the runtime body.
+  const decayRules = extractDecayRules(activeGame).filter(d => d.targetEntityType === myType)
+  const decayRows = decayRules
+    .map(d => {
+      const remainingMs = decayRemainingMs(myEntity, d, now)
+      if (remainingMs == null) return null
+      return {
+        rule: d,
+        remainingMs,
+        pct: Math.min(100, Math.max(0, (remainingMs / d.durationMs) * 100)),
+      }
+    })
+    .filter((r): r is NonNullable<typeof r> => r != null)
+  const suppressedProximityRuleIds = new Set(decayRows.map(r => r.rule.ruleId))
+
   // Proximity progress: one bar per unique (peerEntityType, maxM, minS, teamFilter),
-  // deduped so e.g. CTF's mark_holding / hold_pulse only render once.
+  // deduped so e.g. CTF's mark_holding / hold_pulse only render once. Skip any
+  // rule whose decay timer is currently active for this entity — re-firing is
+  // blocked by the rule's own `not property_age_ms` guard, so showing the bar
+  // would just be noise (and would visibly "tick over" past the 2s threshold
+  // as the proximity_tracker keeps incrementing while the freezer stays
+  // adjacent).
   const proximityRules = extractProximityRules(activeGame).filter(
-    r => r.selfEntityType === myType,
+    r => r.selfEntityType === myType && !suppressedProximityRuleIds.has(r.ruleId),
   )
   const seenProximityKeys = new Set<string>()
   const dedupedProximityRules = proximityRules.filter(r => {
@@ -395,8 +460,6 @@ function NodeGameRuntimeBody({
     seenProximityKeys.add(key)
     return true
   })
-  // eslint-disable-next-line react-hooks/purity -- 4Hz tick pattern (see comment above nowMs)
-  const now = Date.now()
   const proximityRows = dedupedProximityRules.map(r => {
     const closest = closestEntityOfType(snapshot.entities, myPos, r.peerEntityType)
     let startFromMs: number | undefined
@@ -412,8 +475,14 @@ function NodeGameRuntimeBody({
         if (t != null) { startFromMs = t; break }
       }
     }
-    const elapsedMs = startFromMs != null ? Math.max(0, now - startFromMs) : 0
     const thresholdMs = r.minS * 1000
+    // Cap the displayed elapsed time at the threshold — the proximity_tracker
+    // keeps counting past `min_s` while the entities stay adjacent, but the
+    // bar represents progress toward the rule firing, which already happened.
+    // Showing "3.4/2.0s" would mislead users into thinking the rule hasn't
+    // fired yet.
+    const rawElapsedMs = startFromMs != null ? Math.max(0, now - startFromMs) : 0
+    const elapsedMs = Math.min(rawElapsedMs, thresholdMs)
     const pct = thresholdMs > 0 ? Math.min(100, (elapsedMs / thresholdMs) * 100) : 0
     return {
       rule: r,
@@ -437,12 +506,18 @@ function NodeGameRuntimeBody({
   const FLASH_MS = 1200
   const scoreIsDuration = activeGame.duration_s != null
   const formatScore = (v: number): string => (scoreIsDuration ? formatMmSs(v) : String(v))
+  // Games without any `increment_score` rules (e.g. freeze_tag, where the win
+  // condition is "all runners frozen at once" rather than a numeric tally)
+  // never produce non-zero scores. Showing a "Hold 00:00 / 00:00" pill row
+  // every tick is just visual noise — hide the whole section in that case.
+  const showScoreRow = displayTeams.length > 0 && hasScoreEffects(activeGame)
 
   const anyRow =
     propertyRows.length > 0 ||
     proximityRows.length > 0 ||
+    decayRows.length > 0 ||
     nearestPlayer ||
-    displayTeams.length > 0
+    showScoreRow
 
   return (
     <div className="border-t pt-2 space-y-2">
@@ -501,7 +576,7 @@ function NodeGameRuntimeBody({
         </div>
       )}
 
-      {displayTeams.length > 0 && (
+      {showScoreRow && (
         <div className="flex items-center gap-1 text-[11px] flex-wrap">
           <span className="text-muted-foreground mr-0.5">
             {scoreIsDuration ? 'Hold' : 'Scores'}
@@ -578,6 +653,35 @@ function NodeGameRuntimeBody({
           </div>
         </div>
       ))}
+
+      {/* Decay countdowns — e.g. freeze_tag's 30s frozen window. The bar
+          drains from full to empty over `durationMs`; once it hits zero the
+          property age has expired and the row disappears (the rule that
+          gates on `not property_age_ms` can fire again). */}
+      {decayRows.map(row => {
+        const remainingS = row.remainingMs / 1000
+        const totalS = row.rule.durationMs / 1000
+        return (
+          <div key={`decay:${row.rule.ruleId}`} className="space-y-1">
+            <div className="flex items-center gap-1 text-[11px]">
+              <span>🥶</span>
+              <span className="font-semibold text-cyan-300 uppercase tracking-wide text-[10px]">
+                {row.rule.label}
+              </span>
+              <span className="ml-auto tabular-nums text-cyan-300 text-[10px] font-mono">
+                {remainingS.toFixed(1)}s
+              </span>
+            </div>
+            <div className="h-1.5 bg-muted rounded overflow-hidden">
+              <div
+                className="h-full bg-cyan-400 transition-all"
+                style={{ width: `${row.pct}%` }}
+                title={`${remainingS.toFixed(1)}s of ${totalS.toFixed(0)}s remaining`}
+              />
+            </div>
+          </div>
+        )
+      })}
 
       {!propertyRows.length && nearestPlayer && (
         <div className="flex items-center gap-1.5 text-[11px]">

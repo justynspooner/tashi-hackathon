@@ -2,7 +2,15 @@
 //
 // Header: node summary (label, bind, running/stopped, start/stop).
 // Body: stacked collapsible "components":
-//   - Game Select (propose/vote) — shown during no_game/proposing/voting only
+//   - Game Select (propose/vote) — shown during cold-start no_game / first-
+//     time proposing / voting (when no previous round's metadata is around)
+//   - Post-Game (replay / change-roles / new-game) — shown across the whole
+//     `ended → proposing → voting` arc whenever the snapshot still carries a
+//     previous round's `active_game_id`. This is what lets every node — not
+//     just the proposer — express the `keep_roles` intent during the
+//     proposal/vote windows; without it, only the proposer can pick "Replay"
+//     and the rest end up sending vanilla `(game_id, keep_roles=false)`
+//     votes that don't coalesce, splitting the tally and aborting the round.
 //   - Peers (peer table + last-message pill)
 //   - Entity (claim form / runtime / ready-up) — only when a game is loaded
 //   - Events (per-node event log, capped at PER_NODE_EVENT_CAP)
@@ -11,13 +19,14 @@ import { useState } from 'react'
 import { PanelHeader } from '@/components/layout/PanelHeader'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Power, PowerOff, Activity, Flag, ListChecks, Terminal, Gamepad2 } from 'lucide-react'
+import { Power, PowerOff, Activity, Flag, ListChecks, Terminal, Gamepad2, RotateCcw } from 'lucide-react'
 
 import { InspectorSection } from './InspectorSection'
 import { PeersComponent } from './components/PeersComponent'
 import { EntityComponent } from './components/EntityComponent'
 import { EventsComponent } from './components/EventsComponent'
 import { GameSelectComponent } from './components/GameSelectComponent'
+import { GameEndedActions } from './components/GameEndedActions'
 
 import { useData } from '@/state/DataContext'
 import { useActions } from '@/state/ActionsContext'
@@ -40,8 +49,18 @@ export function NodeInspector({ node }: Props) {
   const hasEntityComponent = phase !== 'no_game' && phase !== 'proposing' && phase !== 'voting'
   const bindPort = node.bind.split(':').pop() ?? node.bind
   const isRunning = node.status === 'running'
+  // The post-game UI owns `proposing`/`voting` whenever a previous game's
+  // metadata is still on the snapshot — `apply_proposal` / `apply_vote`
+  // intentionally leave `active_game_id` set across the `Ended → Proposing
+  // → Voting` arc so we can detect "this is a between-rounds vote, not a
+  // cold-start pick" and route the user to the Replay/Change-Roles buttons
+  // (which carry `keep_roles` correctly) instead of the vanilla picker
+  // (which doesn't).
+  const isPostGameVote =
+    (phase === 'proposing' || phase === 'voting') && !!activeGame
+  const showPostGame = phase === 'ended' || isPostGameVote
   const showGameSelect =
-    phase === 'no_game' || phase === 'proposing' || phase === 'voting'
+    (phase === 'no_game' || phase === 'proposing' || phase === 'voting') && !showPostGame
 
   async function handleToggleRunning() {
     setLoading(true)
@@ -105,6 +124,22 @@ export function NodeInspector({ node }: Props) {
             <GameSelectComponent
               node={node}
               snapshot={snapshot}
+              games={games}
+              onProposeGame={onProposeGame}
+              onVoteGame={onVoteGame}
+            />
+          </InspectorSection>
+        )}
+
+        {showPostGame && (
+          <InspectorSection
+            title="Next Round"
+            icon={<RotateCcw className="h-3.5 w-3.5" />}
+          >
+            <GameEndedActions
+              node={node}
+              snapshot={snapshot}
+              activeGame={activeGame}
               games={games}
               onProposeGame={onProposeGame}
               onVoteGame={onVoteGame}

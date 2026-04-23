@@ -90,6 +90,9 @@ export function entityGlyph(entityType: string | null | undefined): string {
     case 'player': return '🟢'
     case 'hill': return '⛰️'
     case 'zone': return '⬛'
+    // freeze_tag — the agent that freezes vs the target trying to stay free.
+    case 'freezer': return '❄️'
+    case 'runner': return '🏃'
     default: return '●'
   }
 }
@@ -112,6 +115,40 @@ export function countClaims(
     n += 1
   }
   return n
+}
+
+/// Return the list of (team) keys to check for cardinality/exhaustion against
+/// a given entity type. Mirrors `games.rs::EntityTypeDef.team` semantics and
+/// the backend's `count_claims` grouping:
+///   - `null`/omitted  → `[null]`               (teamless, one global slot)
+///   - `'per_team'`    → `game.teams`           (one slot per team)
+///   - any other value → `[that fixed string]`  (single fixed-team slot, e.g.
+///                                               `freezer` → `['freezers']`)
+export function teamsForCardinality(
+  etTeam: string | null | undefined,
+  teams: readonly string[],
+): Array<string | null> {
+  if (!etTeam) return [null]
+  if (etTeam === 'per_team') return [...teams]
+  return [etTeam]
+}
+
+/// Resolve the `team` field to submit with a claim for the given entity type.
+/// The backend (`rules.rs::reject_for_cardinality`) requires an exact match:
+///   - teamless types must send `null`,
+///   - `per_team` types must send the user's picked team,
+///   - fixed-team types must send that exact fixed string — sending `null`
+///     here triggers a "requires team=X; none given" reject on every node,
+///     which surfaces as "nothing happened" on the claim because the HTTP
+///     handler returns `200/queued` before validation runs (the reject is
+///     reported asynchronously via the violations feed).
+export function claimTeamFor(
+  etTeam: string | null | undefined,
+  pickedTeam: string,
+): string | null {
+  if (!etTeam) return null
+  if (etTeam === 'per_team') return pickedTeam || null
+  return etTeam
 }
 
 // ---------- Proximity helpers ----------
@@ -217,16 +254,157 @@ export function extractProximityRules(game: GameConfig | undefined): ProximityRu
   return out
 }
 
+// ---------- Decay-rule helpers ----------
+
+/** A rule that sets a "_since_ms" timestamp on an entity AND guards itself
+ *  with `not property_age_ms` for the same key. The pattern represents a
+ *  one-shot timer: once the rule fires, the property's age is 0 and the guard
+ *  blocks re-firing for `durationMs`. After the duration elapses, the
+ *  property silently becomes "stale" and the rule can fire again — no
+ *  explicit cleanup needed. Used by freeze_tag's `freeze_runner` to express
+ *  the 30-second frozen window. The UI surfaces these as a remaining-time
+ *  countdown so players can see when their state expires. */
+export interface DecayRuleInfo {
+  ruleId: string
+  /** Entity type that the property gets set on (e.g. "runner"). */
+  targetEntityType: string
+  /** Property name carrying the wall-clock timestamp (e.g. "frozen_since_ms"). */
+  propertyKey: string
+  /** Total duration in milliseconds (e.g. 30000 for the 30s frozen window). */
+  durationMs: number
+  /** Short, human-readable label for the state (derived from the property
+   *  key — e.g. "frozen_since_ms" → "frozen"). Surfaced on countdown chips. */
+  label: string
+}
+
+/** Convert a "*_since_ms" property key to a human-readable state label.
+ *  E.g. "frozen_since_ms" → "frozen", "tagged_since_ms" → "tagged". */
+function decayLabelFromKey(key: string): string {
+  return key.replace(/_since_ms$/, '').replace(/_/g, ' ') || key
+}
+
+/** Extract all rules that match the "decay timer" pattern: a `set_property`
+ *  or `set_property_on_self` effect paired with a `not property_age_ms` guard
+ *  in the rule's `when` clause for the same property key. The matched rules
+ *  represent state that decays after a fixed duration without explicit
+ *  cleanup — e.g. freeze_tag's 30-second frozen window. */
+export function extractDecayRules(game: GameConfig | undefined): DecayRuleInfo[] {
+  if (!game) return []
+  const out: DecayRuleInfo[] = []
+  for (const rule of game.rules) {
+    const eff = rule.effect as Record<string, unknown>
+    let propertyKey: string | null = null
+    let targetEntityType: string | null = null
+
+    // Walk the `when` clauses once: identify the entity_is target AND look
+    // for a sibling `not property_age_ms` guard for the same key.
+    const when = rule.when as Record<string, unknown>
+    const clauses = Array.isArray((when as { of?: unknown }).of)
+      ? ((when as { of: unknown[] }).of)
+      : [when]
+
+    let entityIs: string | null = null
+    const notAgeMsKeys = new Map<string, number>()
+    for (const raw of clauses) {
+      const c = raw as Record<string, unknown>
+      if (c.kind === 'entity_is' && typeof c.entity_type === 'string') {
+        entityIs = c.entity_type
+      }
+      if (c.kind === 'not') {
+        const inner = c.of as Record<string, unknown> | undefined
+        if (
+          inner?.kind === 'property_age_ms' &&
+          typeof inner.key === 'string' &&
+          typeof inner.max_age_ms === 'number'
+        ) {
+          notAgeMsKeys.set(inner.key, inner.max_age_ms)
+        }
+      }
+    }
+
+    if (
+      (eff.kind === 'set_property' || eff.kind === 'set_property_on_self') &&
+      typeof eff.key === 'string'
+    ) {
+      propertyKey = eff.key
+      if (eff.kind === 'set_property_on_self') {
+        targetEntityType = entityIs
+      } else if (typeof eff.target_entity_type === 'string') {
+        targetEntityType = eff.target_entity_type
+      }
+    }
+    if (!propertyKey || !targetEntityType) continue
+
+    const durationMs = notAgeMsKeys.get(propertyKey)
+    if (durationMs == null) continue
+
+    out.push({
+      ruleId: rule.id,
+      targetEntityType,
+      propertyKey,
+      durationMs,
+      label: decayLabelFromKey(propertyKey),
+    })
+  }
+  return out
+}
+
+/** Convenience: read a numeric property value safely. Returns `null` if the
+ *  property is missing or not a number. */
+export function readNumberProperty(
+  entity: EntityRecord | undefined,
+  key: string,
+): number | null {
+  const raw = entity?.properties?.[key]
+  return typeof raw === 'number' ? raw : null
+}
+
+/** Compute the remaining decay time for an entity given a decay rule. Returns
+ *  `null` if the property isn't set or has already expired. */
+export function decayRemainingMs(
+  entity: EntityRecord | undefined,
+  decay: Pick<DecayRuleInfo, 'propertyKey' | 'durationMs'>,
+  nowMs: number,
+): number | null {
+  const sinceMs = readNumberProperty(entity, decay.propertyKey)
+  if (sinceMs == null) return null
+  const remaining = decay.durationMs - (nowMs - sinceMs)
+  return remaining > 0 ? remaining : null
+}
+
+/** True when at least one rule in the game produces score changes. Games
+ *  without any `increment_score` effects (e.g. freeze_tag's pure end-game
+ *  win conditions) shouldn't render a "Hold/Scores" pill row — those scores
+ *  stay at zero forever and the row is just noise. */
+export function hasScoreEffects(game: GameConfig | undefined): boolean {
+  if (!game) return false
+  return game.rules.some(r => {
+    const eff = r.effect as Record<string, unknown>
+    return eff.kind === 'increment_score'
+  })
+}
+
 // ---------- Proposal/vote tallying ----------
+
+/** Mirrors `src/game_state.rs::GameChoice`. The post-game replay refactor
+ *  changed both windows from `HashMap<String, String>` (just game_id) to
+ *  `HashMap<String, GameChoice>` so Replay vs Change-Roles tally as distinct
+ *  consensus keys — the TS shape has to track that or `proposers[peerId]`
+ *  reads the object as if it were a string and every "you picked X" pill
+ *  silently breaks. */
+export interface GameChoice {
+  game_id: string
+  keep_roles: boolean
+}
 
 export interface ProposalWindow {
   started_at_ms?: number
-  proposers?: Record<string, string>
+  proposers?: Record<string, GameChoice>
 }
 
 export interface VoteWindow {
   started_at_ms?: number
-  votes?: Record<string, string>
+  votes?: Record<string, GameChoice>
 }
 
 export function readProposalWindow(snap: LocalGameSnapshot | undefined): ProposalWindow | undefined {
@@ -247,8 +425,12 @@ export function tallyPicks(
       ? readProposalWindow(snap)?.proposers
       : readVoteWindow(snap)?.votes
     if (!picks) continue
-    for (const gid of Object.values(picks)) {
-      out[gid] = (out[gid] ?? 0) + 1
+    for (const choice of Object.values(picks)) {
+      // The keep_roles intent is a separate axis (Replay vs Change-Roles
+      // are distinct choices on the same game_id), but for the swarm-wide
+      // "what game did peers pick" tally callers only care about which
+      // mode is in flight. Sum to one bucket per game_id.
+      out[choice.game_id] = (out[choice.game_id] ?? 0) + 1
     }
     // Snapshots converge — reading one is enough.
     break

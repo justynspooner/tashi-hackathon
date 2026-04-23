@@ -197,7 +197,9 @@ pub async fn serve(port: u16) -> anyhow::Result<()> {
         .route("/api/nodes/{label}/stop", post(stop_node))
         .route("/api/nodes/{label}/position", post(set_position))
         .route("/api/nodes/{label}/propose-game/{game_id}", post(propose_game))
+        .route("/api/nodes/{label}/propose-replay", post(propose_replay))
         .route("/api/nodes/{label}/vote-game/{game_id}", post(vote_game))
+        .route("/api/nodes/{label}/vote-replay", post(vote_replay))
         .route("/api/nodes/{label}/entity-type", post(claim_entity))
         .route("/api/nodes/{label}/ready", post(ready_up))
         .route("/api/game-state", get(get_game_snapshots))
@@ -1266,6 +1268,42 @@ async fn propose_game(
     }
 }
 
+#[derive(Deserialize)]
+struct ReplayProposalRequest {
+    game_id: String,
+    /// `true` means "Replay with existing roles" — the next round preserves
+    /// each node's claimed entity_type/team. `false` means "Change roles"
+    /// (same game, claims wiped) — functionally identical to a regular
+    /// `propose_game` on the same game_id; exposed here so both post-game
+    /// options share a single HTTP surface.
+    #[serde(default)]
+    keep_roles: bool,
+}
+
+/// Post-game replay proposal. Called by the `GameEndedActions` buttons in
+/// the inspector UI. Thread `keep_roles` through to the backend's
+/// GameProposal wire message so the consensus tally treats Replay and
+/// Change-Roles as distinct outcomes (see `game_state::GameChoice`).
+async fn propose_replay(
+    State(state): State<Arc<AppState>>,
+    AxumPath(label): AxumPath<String>,
+    Json(body): Json<ReplayProposalRequest>,
+) -> Json<serde_json::Value> {
+    let cmd = serde_json::json!({
+        "command": "propose_game",
+        "game_id": body.game_id,
+        "keep_roles": body.keep_roles,
+    });
+    match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => Json(serde_json::json!({
+            "status": "queued",
+            "game_id": body.game_id,
+            "keep_roles": body.keep_roles,
+        })),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
 async fn vote_game(
     State(state): State<Arc<AppState>>,
     AxumPath((label, game_id)): AxumPath<(String, String)>,
@@ -1273,6 +1311,32 @@ async fn vote_game(
     let cmd = serde_json::json!({ "command": "vote_game", "game_id": game_id });
     match write_game_cmd(&state, &label, cmd) {
         Ok(()) => Json(serde_json::json!({"status": "queued", "game_id": game_id})),
+        Err(e) => Json(serde_json::json!({"error": e})),
+    }
+}
+
+/// Post-game replay vote. Mirrors `propose_replay` but emits a `vote_game`
+/// command instead of `propose_game`. Without this, a node that lands in
+/// `Voting` mid-flight (because another node proposed Replay first) has no
+/// way to express the `keep_roles=true` intent — the path-based `vote-game`
+/// route always defaults `keep_roles` to `false`, which the consensus tally
+/// treats as a *different* choice and prevents the swarm from converging.
+async fn vote_replay(
+    State(state): State<Arc<AppState>>,
+    AxumPath(label): AxumPath<String>,
+    Json(body): Json<ReplayProposalRequest>,
+) -> Json<serde_json::Value> {
+    let cmd = serde_json::json!({
+        "command": "vote_game",
+        "game_id": body.game_id,
+        "keep_roles": body.keep_roles,
+    });
+    match write_game_cmd(&state, &label, cmd) {
+        Ok(()) => Json(serde_json::json!({
+            "status": "queued",
+            "game_id": body.game_id,
+            "keep_roles": body.keep_roles,
+        })),
         Err(e) => Json(serde_json::json!({"error": e})),
     }
 }

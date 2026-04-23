@@ -57,8 +57,11 @@ pub enum WebEvent {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum NodeCommand {
-    ProposeGame(String),
-    VoteGame(String),
+    /// `keep_roles` propagates into the `GameProposal` wire payload — `true`
+    /// means "replay with existing roles" (the post-game Replay button),
+    /// `false` means the normal propose-a-game flow.
+    ProposeGame { game_id: String, keep_roles: bool },
+    VoteGame { game_id: String, keep_roles: bool },
     ClaimEntity { entity_type: String, team: Option<String> },
     SetPosition { x: f32, y: f32 },
     ReadyUp,

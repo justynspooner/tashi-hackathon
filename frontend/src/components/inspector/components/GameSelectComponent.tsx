@@ -50,10 +50,16 @@ export function GameSelectComponent({
 
   const proposers = readProposalWindow(snapshot)?.proposers ?? {}
   const votes = readVoteWindow(snapshot)?.votes ?? {}
-  const committedGameId = isVoting
+  // `proposers[peerId]` / `votes[peerId]` carry a `GameChoice` object now
+  // (game_id + keep_roles), not the bare game_id string they used to. Reach
+  // into `.game_id` to recover the bit this picker cares about — the
+  // keep_roles intent is the post-game-actions panel's job.
+  const committedChoice = isVoting
     ? (myPeerId ? votes[myPeerId] : undefined)
     : (phase === 'proposing' && myPeerId ? proposers[myPeerId] : undefined)
-  const committed = games.find(g => g.id === committedGameId)
+  const committed = committedChoice
+    ? games.find(g => g.id === committedChoice.game_id)
+    : undefined
 
   const disabled = node.status !== 'running' || games.length === 0
 

@@ -4,7 +4,6 @@
 // toggle, and the connection badge.
 
 import { useMemo } from 'react'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Terminal, Trash2 } from 'lucide-react'
 
@@ -21,7 +20,6 @@ interface Props {
   snapshots: Record<string, LocalGameSnapshot>
   games: GameConfig[]
   connected: boolean
-  eventCount: number
   eventLogOpen: boolean
   onToggleEventLog: () => void
   onClearArtifacts: () => void
@@ -39,7 +37,6 @@ export function TopChrome({
   snapshots,
   games,
   connected,
-  eventCount,
   eventLogOpen,
   onToggleEventLog,
   onClearArtifacts,
@@ -140,11 +137,6 @@ export function TopChrome({
         >
           <Terminal className="h-3 w-3" />
           Event Log
-          {eventCount > 0 && (
-            <Badge variant="secondary" className="ml-1 text-[10px]">
-              {eventCount}
-            </Badge>
-          )}
         </Button>
 
         <ModeToggle />

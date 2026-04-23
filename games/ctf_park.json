@@ -1,0 +1,84 @@
+{
+  "id": "ctf_park",
+  "name": "Park Capture the Flag",
+  "teams": ["red", "blue"],
+  "duration_s": 420,
+  "entity_types": [
+    { "id": "flag",   "min": 1, "max": 1, "team": null,       "visual": "flag" },
+    { "id": "jail",   "min": 1, "max": 1, "team": "per_team", "visual": "jail" },
+    { "id": "base",   "min": 1, "max": 1, "team": "per_team", "visual": "base" },
+    { "id": "player", "min": 4, "max": 6, "team": "per_team", "visual": "player" }
+  ],
+  "placement": [
+    { "entity": "player", "requires": { "kind": "within_m_of",        "entity": "base", "same_team": true, "max_m": 3.0 } },
+    { "entity": "jail",   "requires": { "kind": "within_m_of",        "entity": "base", "same_team": true, "max_m": 4.0 } },
+    { "entity": "flag",   "requires": { "kind": "farther_than_m_from", "entity": "base",                   "min_m": 15.0 } },
+    { "entity": "jail",   "requires": { "kind": "farther_than_m_from", "entity": "flag",                   "min_m": 8.0 } }
+  ],
+  "rules": [
+    {
+      "//": "Mark flag holder — base detects flag within 1m for 3s, stamps flag.holding_team for the UI. 3s dwell (vs 1s vanilla CTF) represents physically securing the flag at base. No team filter on proximity needed: the flag is neutral and the rule fires from the base's perspective, so self.team resolves to the capturing team directly.",
+      "id": "mark_flag_holder",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "base" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 3 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "flag", "key": "holding_team", "value": "self.team" }
+    },
+    {
+      "//": "Flag hold pulse — same trigger, writes now_ms each tick so the delta-triggered score rule fires 1/sec. Maps the park '3 pts per capture' into 3 pts/sec of possession.",
+      "id": "flag_hold_pulse",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "base" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "flag", "max_m": 1.0, "min_s": 3 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "flag", "key": "hold_pulse_ms", "value": "now_ms" }
+    },
+    {
+      "//": "Flag hold scoring — delta-triggered, 3 pts per tick of flag possession at base. Primary objective.",
+      "id": "flag_hold_score",
+      "on": "game_state_delta",
+      "when": { "kind": "property_changed", "target_entity_type": "flag", "key": "hold_pulse_ms" },
+      "effect": { "kind": "increment_score", "team": "self.team", "by": 3 }
+    },
+    {
+      "//": "Mark jail liberator — player within 2m of an *enemy* jail for 4s stamps jail.liberating_team. different_team: true on the proximity predicate filters out the player's own jail, so camping your own side is a no-op. 4s dwell creates a vulnerability window for physical tagging.",
+      "id": "mark_jail_liberator",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "player" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "jail", "different_team": true, "max_m": 2.0, "min_s": 4 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "jail", "key": "liberating_team", "value": "self.team" }
+    },
+    {
+      "//": "Jail free pulse — same different-team trigger, writes now_ms each tick for delta-based scoring. Maps park '1 pt per jailbreak' into 1 pt/sec while raiding an enemy jail. 3:1 ratio vs flag mirrors physical scoring weights.",
+      "id": "jail_free_pulse",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "player" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "jail", "different_team": true, "max_m": 2.0, "min_s": 4 }
+      ] },
+      "effect": { "kind": "set_property", "target_entity_type": "jail", "key": "free_pulse_ms", "value": "now_ms" }
+    },
+    {
+      "//": "Jail free scoring — delta-triggered, 1 pt per tick of enemy-jail presence. Secondary objective.",
+      "id": "jail_free_score",
+      "on": "game_state_delta",
+      "when": { "kind": "property_changed", "target_entity_type": "jail", "key": "free_pulse_ms" },
+      "effect": { "kind": "increment_score", "team": "self.team", "by": 1 }
+    },
+    {
+      "//": "7-minute time limit — fires from the flag node only (single source). highest_score picks winner; ties = draw.",
+      "id": "time_limit",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "flag" },
+        { "kind": "game_time_elapsed_s", "min_s": 420 }
+      ] },
+      "effect": { "kind": "end_game", "winner_team": "highest_score", "reason": "7-minute time limit reached" }
+    }
+  ]
+}

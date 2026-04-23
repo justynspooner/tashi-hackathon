@@ -30,8 +30,10 @@ export interface GamePresentation {
 export const PRESENTATIONS: Record<string, GamePresentation> = {
   no_game: {},
   ctf: {},
+  ctf_park: {},
   king_of_the_hill: {},
   territory: {},
+  freeze_tag: {},
 }
 
 export function presentationFor(gameId: string | null | undefined): GamePresentation {
@@ -44,6 +46,11 @@ export const TEAM_COLORS: Record<string, string> = {
   red: '#ef4444',
   blue: '#3b82f6',
   green: '#22c55e',
+  // freeze_tag — cool cyan for the side that freezes, warm orange for the
+  // side that runs. Keeps the field legible when both types render on top
+  // of team-coloured circles.
+  freezers: '#06b6d4',
+  runners: '#f97316',
 }
 
 export function teamColor(team: string | null | undefined): string {

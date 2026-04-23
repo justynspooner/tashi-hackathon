@@ -9,8 +9,16 @@ import { createContext, useContext, type ReactNode } from 'react'
 export interface AppActions {
   onStart: (label: string) => Promise<void>
   onStop: (label: string) => Promise<void>
-  onProposeGame: (label: string, gameId: string) => Promise<void>
-  onVoteGame: (label: string, gameId: string) => Promise<void>
+  onProposeGame: (
+    label: string,
+    gameId: string,
+    opts?: { keepRoles?: boolean },
+  ) => Promise<void>
+  onVoteGame: (
+    label: string,
+    gameId: string,
+    opts?: { keepRoles?: boolean },
+  ) => Promise<void>
   onClaimEntity: (
     label: string,
     entityType: string,

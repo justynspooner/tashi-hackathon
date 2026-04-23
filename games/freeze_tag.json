@@ -1,0 +1,53 @@
+{
+  "id": "freeze_tag",
+  "name": "Freeze Tag 2v2",
+  "teams": ["freezers", "runners"],
+  "duration_s": 120,
+  "entity_types": [
+    { "id": "freezer", "min": 2, "max": 2, "team": "freezers", "visual": "player" },
+    { "id": "runner",  "min": 2, "max": 2, "team": "runners",  "visual": "player" }
+  ],
+  "placement": [
+    { "entity": "freezer", "requires": { "kind": "farther_than_m_from", "entity": "runner", "min_m": 5.0 } }
+  ],
+  "rules": [
+    {
+      "//": "Freeze — a runner tagged by a freezer (different-team, within 1m for 2s) writes `frozen_since_ms = now_ms` on themselves. The `not property_age_ms` guard prevents the timer from resetting every tick the freezer stays in range: once frozen, they stay frozen for 30s regardless of continued proximity. After 30s the guard flips back to true and the runner can be re-frozen.",
+      "id": "freeze_runner",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "runner" },
+        { "kind": "proximity_duration_s", "peer_entity_type": "freezer", "different_team": true, "max_m": 1.0, "min_s": 2 },
+        { "kind": "not", "of": { "kind": "property_age_ms", "key": "frozen_since_ms", "max_age_ms": 30000 } }
+      ] },
+      "effect": { "kind": "set_property_on_self", "key": "frozen_since_ms", "value": "now_ms" }
+    },
+    {
+      "//": "Freezers win — fires the instant every runner's `frozen_since_ms` is within the last 30s (i.e. all runners are simultaneously frozen). Anchored on entity_is: freezer so the rule only broadcasts from a freezer's perspective; duplicate GameEnds from the two freezer nodes are idempotent on receive.",
+      "id": "freezers_win",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "freezer" },
+        { "kind": "all_entities_property_recent",
+          "entity_type": "runner",
+          "key": "frozen_since_ms",
+          "max_age_ms": 30000 }
+      ] },
+      "effect": { "kind": "end_game", "winner_team": "freezers", "reason": "All runners frozen simultaneously" }
+    },
+    {
+      "//": "Runners win — fires when the 2-minute timer elapses AND not every runner is currently frozen. The NOT all_entities_property_recent guard is the tiebreaker: at the exact tick the clock hits 120s, if the freezers have simultaneously frozen everyone, freezers_win takes priority; otherwise the runners survived long enough.",
+      "id": "runners_win_timeout",
+      "on": "tick",
+      "when": { "kind": "all", "of": [
+        { "kind": "entity_is", "entity_type": "freezer" },
+        { "kind": "game_time_elapsed_s", "min_s": 120 },
+        { "kind": "not", "of": { "kind": "all_entities_property_recent",
+          "entity_type": "runner",
+          "key": "frozen_since_ms",
+          "max_age_ms": 30000 } }
+      ] },
+      "effect": { "kind": "end_game", "winner_team": "runners", "reason": "Runners survived 2 minutes" }
+    }
+  ]
+}

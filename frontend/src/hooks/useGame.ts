@@ -87,25 +87,64 @@ export function useGameActions() {
     }
   }, [])
 
-  const proposeGame = useCallback(async (label: string, gameId: string) => {
-    try {
-      const res = await fetch(`/api/nodes/${label}/propose-game/${gameId}`, { method: 'POST' })
-      if (!res.ok) throw new Error(`propose failed: ${res.status}`)
-    } catch (err) {
-      errorToast(`Propose on ${label} failed`, err)
-      throw err
-    }
-  }, [])
+  const proposeGame = useCallback(
+    async (label: string, gameId: string, opts?: { keepRoles?: boolean }) => {
+      const keepRoles = opts?.keepRoles ?? false
+      // The legacy path is keep_roles=false; use it unchanged so anything
+      // hitting the old endpoint (tests, curl, old frontend bundles) keeps
+      // working. Only the post-game Replay button actually sets keepRoles.
+      const url = keepRoles
+        ? `/api/nodes/${label}/propose-replay`
+        : `/api/nodes/${label}/propose-game/${gameId}`
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          ...(keepRoles
+            ? {
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ game_id: gameId, keep_roles: true }),
+              }
+            : {}),
+        })
+        if (!res.ok) throw new Error(`propose failed: ${res.status}`)
+      } catch (err) {
+        errorToast(`Propose on ${label} failed`, err)
+        throw err
+      }
+    },
+    [],
+  )
 
-  const voteGame = useCallback(async (label: string, gameId: string) => {
-    try {
-      const res = await fetch(`/api/nodes/${label}/vote-game/${gameId}`, { method: 'POST' })
-      if (!res.ok) throw new Error(`vote failed: ${res.status}`)
-    } catch (err) {
-      errorToast(`Vote on ${label} failed`, err)
-      throw err
-    }
-  }, [])
+  const voteGame = useCallback(
+    async (label: string, gameId: string, opts?: { keepRoles?: boolean }) => {
+      const keepRoles = opts?.keepRoles ?? false
+      // Mirror `proposeGame`'s split: the path-based legacy route hard-codes
+      // keep_roles=false, so post-game replay/change-roles votes have to go
+      // through the body-based `vote-replay` endpoint to carry the intent
+      // intact. Without this, a node voting "Replay" lands a `(game_id,
+      // keep_roles=false)` choice that doesn't coalesce with the proposer's
+      // `(game_id, keep_roles=true)` and the swarm can't reach consensus.
+      const url = keepRoles
+        ? `/api/nodes/${label}/vote-replay`
+        : `/api/nodes/${label}/vote-game/${gameId}`
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          ...(keepRoles
+            ? {
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ game_id: gameId, keep_roles: true }),
+              }
+            : {}),
+        })
+        if (!res.ok) throw new Error(`vote failed: ${res.status}`)
+      } catch (err) {
+        errorToast(`Vote on ${label} failed`, err)
+        throw err
+      }
+    },
+    [],
+  )
 
   const claimEntity = useCallback(
     async (label: string, entityType: string, team: string | null) => {

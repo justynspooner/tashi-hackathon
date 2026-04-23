@@ -28,9 +28,12 @@ fn loads_every_shipped_game() {
     let configs = load_all(&dir).expect("load_all should succeed");
     assert!(!configs.is_empty(), "should load at least one game config");
 
-    // Expect the three shipped games. If this list diverges, update the
+    // Expect the shipped games. If this list diverges, update the
     // test and the plan together — it's intentional prose, not a helper.
-    let expected: HashSet<&str> = ["ctf", "king_of_the_hill", "territory"].into_iter().collect();
+    let expected: HashSet<&str> =
+        ["ctf", "ctf_park", "king_of_the_hill", "territory", "freeze_tag"]
+            .into_iter()
+            .collect();
     let got: HashSet<&str> = configs.keys().map(|s| s.as_str()).collect();
     for id in &expected {
         assert!(got.contains(id), "missing shipped game: {id}");

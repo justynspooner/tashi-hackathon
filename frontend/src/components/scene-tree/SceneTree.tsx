@@ -8,6 +8,7 @@ import { SceneTreeRow } from './SceneTreeRow'
 import { TeamGroupHeader } from './TeamGroupHeader'
 import { ObstaclesSection } from './ObstaclesSection'
 import { useSelection } from '@/state/SelectionContext'
+import { useData } from '@/state/DataContext'
 import type { NodeInfo } from '@/types'
 import type { EntityRecord, LocalGameSnapshot } from '@/game/types'
 
@@ -36,6 +37,10 @@ function resolveEntity(
 
 export function SceneTree({ nodes, snapshots }: Props) {
   const { selection, selectNode } = useSelection()
+  // Pulled in for game-aware row decoration (decay countdowns like
+  // freeze_tag's frozen window). The row component looks up its own decay
+  // rules from the config rather than receiving them per-node.
+  const { activeGame } = useData()
   const hasSnapshots = Object.keys(snapshots).length > 0
 
   // Group nodes by team (A4): "Unassigned" for nodes without a claimed entity.
@@ -97,6 +102,7 @@ export function SceneTree({ nodes, snapshots }: Props) {
                 entity={undefined}
                 selected={selectedLabel === node.label}
                 onClick={() => selectNode(node.label)}
+                activeGame={activeGame}
               />
             ))}
           </div>
@@ -124,6 +130,7 @@ export function SceneTree({ nodes, snapshots }: Props) {
                           entity={entity}
                           selected={selectedLabel === node.label}
                           onClick={() => selectNode(node.label)}
+                          activeGame={activeGame}
                         />
                       ))}
                     </div>

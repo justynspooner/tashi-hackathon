@@ -73,7 +73,15 @@ export interface EntityTypeDef {
   id: string
   min: number
   max: number
-  team: null | 'per_team'
+  /**
+   * Team assignment for this entity type. Mirrors `games.rs::EntityTypeDef.team`:
+   *   - `null` or omitted: teamless entity (e.g. a neutral prop like `flag`).
+   *   - `'per_team'`: one instance per team; the user picks which at claim time.
+   *   - any other string: a fixed team name (rare but supported). The user
+   *     doesn't pick a team; the claim always sends this exact string. Used by
+   *     `freeze_tag.json` (`freezer` → `'freezers'`, `runner` → `'runners'`).
+   */
+  team: string | null
   visual: string
 }
 

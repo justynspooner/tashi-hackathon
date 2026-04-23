@@ -1255,6 +1255,19 @@ function EntityGlyph({
         />
       </>
     )
+  } else if (type === 'freezer' || type === 'runner') {
+    // freeze_tag — team-coloured circle with a distinguishing emoji.
+    // Falls back to the generic grey circle visuals for any other unknown
+    // type, so adding new player-like entity types in future games only
+    // requires an entityGlyph + teamColor entry to render nicely.
+    body = (
+      <>
+        <circle r={14} fill={color} stroke={strokeColor} strokeWidth={1.5} />
+        <text textAnchor="middle" dominantBaseline="central" fontSize={16}>
+          {type === 'freezer' ? '❄️' : '🏃'}
+        </text>
+      </>
+    )
   } else {
     body = (
       <circle

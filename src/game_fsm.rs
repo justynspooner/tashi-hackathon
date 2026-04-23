@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::game_state::{GamePhase, LocalGameState, ProposalWindow, VoteWindow};
+use crate::game_state::{GameChoice, GamePhase, LocalGameState, ProposalWindow, VoteWindow};
 
 /// Window durations (milliseconds).
 pub const PROPOSAL_WINDOW_MS: u64 = 30_000;
@@ -22,37 +22,47 @@ pub const VOTE_WINDOW_MS: u64 = 30_000;
 /// Effect the FSM wants the caller to apply.
 #[derive(Debug, Clone)]
 pub enum FsmEffect {
-    /// The local node should auto-broadcast its own vote for `game_id`.
-    AutoVote { game_id: String },
+    /// The local node should auto-broadcast its own vote for `choice`.
+    AutoVote { choice: GameChoice },
     /// Game is loaded — caller should set active_game_id and transition to
-    /// PlacingEntities.
-    LoadGame { game_id: String },
+    /// PlacingEntities. `keep_roles` tells the caller whether the lineup from
+    /// the prior round was preserved (true → skip the claim step in the UI)
+    /// or wiped (false → normal placing_entities flow).
+    LoadGame { choice: GameChoice },
 }
 
 /// Apply a new `GameProposal` from `proposer_peer_id`.
 pub fn apply_proposal(
     state: &mut LocalGameState,
     proposer_peer_id: String,
-    game_id: String,
+    choice: GameChoice,
     now_ms: u64,
     swarm_size: usize,
 ) -> Vec<FsmEffect> {
     let mut effects = Vec::new();
-    if matches!(state.phase, GamePhase::Loaded | GamePhase::PlacingEntities | GamePhase::Ready | GamePhase::CountingDown | GamePhase::Playing | GamePhase::Ended) {
+    // A round in-flight — loaded / placing / playing — swallows new proposals.
+    // `Ended`, by contrast, is terminal for the *previous* round: allow a new
+    // proposal to open a fresh round from there, same as from `NoGame`. The
+    // stale game-instance state is wiped when the FSM eventually transitions
+    // into `Loaded` (see `reset_for_new_game`).
+    if matches!(state.phase, GamePhase::Loaded | GamePhase::PlacingEntities | GamePhase::Ready | GamePhase::CountingDown | GamePhase::Playing) {
         return effects;
     }
-    if state.phase == GamePhase::NoGame {
+    if matches!(state.phase, GamePhase::NoGame | GamePhase::Ended) {
         state.phase = GamePhase::Proposing;
     }
     let window = state
         .proposal_window
         .get_or_insert(ProposalWindow { started_at_ms: now_ms, proposers: HashMap::new() });
-    window.proposers.insert(proposer_peer_id, game_id);
+    window.proposers.insert(proposer_peer_id, choice);
 
-    // Only move on once a *specific* game has crossed the strict majority
+    // Only move on once a *specific* choice has crossed the strict majority
     // threshold. Counting distinct proposers would let the FSM commit on a
     // split proposal (e.g. 2/2/2 in a 6-of-7 swarm), which is exactly the
-    // behaviour we want to avoid.
+    // behaviour we want to avoid. `(game_id, keep_roles)` is the consensus
+    // key so "Replay freeze_tag" and "Change roles in freeze_tag" tally
+    // independently — a 2/2 split between those two intents aborts rather
+    // than silently picking one.
     let tally = tally(&window.proposers);
     if let Some(winner) = majority_winner(&tally, swarm_size) {
         state.phase = GamePhase::Voting;
@@ -61,7 +71,7 @@ pub fn apply_proposal(
             votes: HashMap::new(),
         });
         state.proposal_window = None;
-        effects.push(FsmEffect::AutoVote { game_id: winner });
+        effects.push(FsmEffect::AutoVote { choice: winner });
         return effects;
     }
 
@@ -78,7 +88,7 @@ pub fn apply_proposal(
 pub fn apply_vote(
     state: &mut LocalGameState,
     voter_peer_id: String,
-    game_id: String,
+    choice: GameChoice,
     _now_ms: u64,
     swarm_size: usize,
 ) -> Vec<FsmEffect> {
@@ -87,17 +97,16 @@ pub fn apply_vote(
         return effects;
     }
     let window = state.vote_window.get_or_insert_with(Default::default);
-    window.votes.insert(voter_peer_id, game_id);
+    window.votes.insert(voter_peer_id, choice);
 
     let tally = tally(&window.votes);
 
-    // Lock in as soon as a specific game clears the strict majority
+    // Lock in as soon as a specific choice clears the strict majority
     // threshold. No need to wait for stragglers once the outcome is
     // mathematically decided.
     if let Some(winner) = majority_winner(&tally, swarm_size) {
-        state.phase = GamePhase::Loaded;
-        state.active_game_id = Some(winner.clone());
-        effects.push(FsmEffect::LoadGame { game_id: winner });
+        lock_in(state, winner.clone());
+        effects.push(FsmEffect::LoadGame { choice: winner });
         return effects;
     }
 
@@ -130,11 +139,10 @@ pub fn on_tick(state: &mut LocalGameState, now_ms: u64, swarm_size: usize) -> Ve
                 if now_ms.saturating_sub(win.started_at_ms) >= VOTE_WINDOW_MS {
                     let tally = tally(&win.votes);
                     if let Some(winner) = majority_winner(&tally, swarm_size) {
-                        // A specific game had majority at timeout — lock
+                        // A specific choice had majority at timeout — lock
                         // it in even though stragglers never weighed in.
-                        state.phase = GamePhase::Loaded;
-                        state.active_game_id = Some(winner.clone());
-                        effects.push(FsmEffect::LoadGame { game_id: winner });
+                        lock_in(state, winner.clone());
+                        effects.push(FsmEffect::LoadGame { choice: winner });
                     } else {
                         // Split vote (or silent window) — drop back so
                         // players can start a fresh round.
@@ -149,19 +157,31 @@ pub fn on_tick(state: &mut LocalGameState, now_ms: u64, swarm_size: usize) -> Ve
     effects
 }
 
-fn tally(map: &HashMap<String, String>) -> HashMap<String, usize> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+/// Commit the winning `choice`: run the right state-reset variant (keep-roles
+/// or full wipe) and advance the FSM to `Loaded` with the new game_id.
+fn lock_in(state: &mut LocalGameState, choice: GameChoice) {
+    if choice.keep_roles {
+        state.reset_for_new_round_keeping_roles();
+    } else {
+        state.reset_for_new_game();
+    }
+    state.phase = GamePhase::Loaded;
+    state.active_game_id = Some(choice.game_id);
+}
+
+fn tally(map: &HashMap<String, GameChoice>) -> HashMap<GameChoice, usize> {
+    let mut counts: HashMap<GameChoice, usize> = HashMap::new();
     for v in map.values() {
         *counts.entry(v.clone()).or_insert(0) += 1;
     }
     counts
 }
 
-/// Return the game id that has strictly more than half of the swarm
-/// behind it, if any. Plurality is not enough — ties and split votes
-/// return `None`. Only one game can ever clear the threshold at a time,
-/// so no tie-breaking is required.
-fn majority_winner(tally: &HashMap<String, usize>, swarm_size: usize) -> Option<String> {
+/// Return the choice that has strictly more than half of the swarm behind
+/// it, if any. Plurality is not enough — ties and split votes return `None`.
+/// Only one choice can ever clear the threshold at a time, so no
+/// tie-breaking is required.
+fn majority_winner(tally: &HashMap<GameChoice, usize>, swarm_size: usize) -> Option<GameChoice> {
     let threshold = swarm_size / 2 + 1;
     tally
         .iter()
@@ -177,28 +197,40 @@ mod tests {
         LocalGameState::new("a".into(), "PK_A".into(), None)
     }
 
+    /// Test shorthand — the overwhelming majority of FSM tests just care
+    /// about the game_id and want the "clear claims" reset path, so
+    /// wrapping `GameChoice::new_game` keeps the existing assertions
+    /// readable.
+    fn ng(game_id: &str) -> GameChoice {
+        GameChoice::new_game(game_id)
+    }
+
     #[test]
     fn proposing_to_voting_on_majority() {
         let mut s = blank();
         // Swarm of 3. Majority = 2 distinct proposers.
-        let e1 = apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 100, 3);
+        let e1 = apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 100, 3);
         assert!(e1.is_empty());
         assert_eq!(s.phase, GamePhase::Proposing);
-        let e2 = apply_proposal(&mut s, "PK_B".into(), "ctf".into(), 200, 3);
+        let e2 = apply_proposal(&mut s, "PK_B".into(), ng("ctf"), 200, 3);
         assert_eq!(s.phase, GamePhase::Voting);
-        assert!(matches!(e2.as_slice(), [FsmEffect::AutoVote { game_id }] if game_id == "ctf"));
+        assert!(
+            matches!(e2.as_slice(), [FsmEffect::AutoVote { choice }] if choice.game_id == "ctf")
+        );
     }
 
     #[test]
     fn voting_to_loaded_when_all_vote() {
         let mut s = blank();
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, 2);
-        apply_proposal(&mut s, "PK_B".into(), "ctf".into(), 0, 2);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, 2);
+        apply_proposal(&mut s, "PK_B".into(), ng("ctf"), 0, 2);
         assert_eq!(s.phase, GamePhase::Voting);
-        let _ = apply_vote(&mut s, "PK_A".into(), "ctf".into(), 1, 2);
-        let e = apply_vote(&mut s, "PK_B".into(), "ctf".into(), 2, 2);
+        let _ = apply_vote(&mut s, "PK_A".into(), ng("ctf"), 1, 2);
+        let e = apply_vote(&mut s, "PK_B".into(), ng("ctf"), 2, 2);
         assert_eq!(s.phase, GamePhase::Loaded);
-        assert!(matches!(e.as_slice(), [FsmEffect::LoadGame { game_id }] if game_id == "ctf"));
+        assert!(
+            matches!(e.as_slice(), [FsmEffect::LoadGame { choice }] if choice.game_id == "ctf" && !choice.keep_roles)
+        );
     }
 
     #[test]
@@ -207,7 +239,7 @@ mod tests {
         // the FSM should stay in Proposing until the window elapses, then
         // fall back to NoGame.
         let mut s = blank();
-        let effects = apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 100, 5);
+        let effects = apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 100, 5);
         assert!(effects.is_empty());
         assert_eq!(s.phase, GamePhase::Proposing);
 
@@ -232,15 +264,15 @@ mod tests {
         // to NoGame rather than silently loading the plurality winner.
         let mut s = blank();
         let swarm = 5;
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_B".into(), "ctf".into(), 0, swarm);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, swarm);
+        apply_proposal(&mut s, "PK_B".into(), ng("ctf"), 0, swarm);
         let vote_opened_at = 100;
-        apply_proposal(&mut s, "PK_C".into(), "ctf".into(), vote_opened_at, swarm);
+        apply_proposal(&mut s, "PK_C".into(), ng("ctf"), vote_opened_at, swarm);
         assert_eq!(s.phase, GamePhase::Voting);
 
-        apply_vote(&mut s, "PK_A".into(), "ctf".into(), 200, swarm);
-        apply_vote(&mut s, "PK_B".into(), "ctf".into(), 300, swarm);
-        apply_vote(&mut s, "PK_C".into(), "koth".into(), 400, swarm);
+        apply_vote(&mut s, "PK_A".into(), ng("ctf"), 200, swarm);
+        apply_vote(&mut s, "PK_B".into(), ng("ctf"), 300, swarm);
+        apply_vote(&mut s, "PK_C".into(), ng("koth"), 400, swarm);
         assert_eq!(s.phase, GamePhase::Voting);
 
         let effects = on_tick(&mut s, vote_opened_at + VOTE_WINDOW_MS, swarm);
@@ -255,9 +287,9 @@ mod tests {
         // proposal time) but nobody ever followed through with the
         // actual vote. Window elapses; we drop back to NoGame.
         let mut s = blank();
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, 2);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, 2);
         let vote_opened_at = 100;
-        apply_proposal(&mut s, "PK_B".into(), "ctf".into(), vote_opened_at, 2);
+        apply_proposal(&mut s, "PK_B".into(), ng("ctf"), vote_opened_at, 2);
         assert_eq!(s.phase, GamePhase::Voting);
 
         // The FSM itself does not record votes in response to proposals;
@@ -284,15 +316,15 @@ mod tests {
         // NoGame, not silently commit to the plurality winner.
         let mut s = blank();
         let swarm = 7;
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_B".into(), "ctf".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_C".into(), "koth".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_D".into(), "koth".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_E".into(), "territory".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_F".into(), "territory".into(), 0, swarm);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, swarm);
+        apply_proposal(&mut s, "PK_B".into(), ng("ctf"), 0, swarm);
+        apply_proposal(&mut s, "PK_C".into(), ng("koth"), 0, swarm);
+        apply_proposal(&mut s, "PK_D".into(), ng("koth"), 0, swarm);
+        apply_proposal(&mut s, "PK_E".into(), ng("territory"), 0, swarm);
+        apply_proposal(&mut s, "PK_F".into(), ng("territory"), 0, swarm);
         assert_eq!(s.phase, GamePhase::Proposing);
 
-        let effects = apply_proposal(&mut s, "PK_G".into(), "ctf".into(), 100, swarm);
+        let effects = apply_proposal(&mut s, "PK_G".into(), ng("ctf"), 100, swarm);
         assert!(effects.is_empty());
         assert_eq!(s.phase, GamePhase::NoGame);
         assert!(s.proposal_window.is_none());
@@ -306,17 +338,17 @@ mod tests {
         // nodes disagreed.
         let mut s = blank();
         let swarm = 7;
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_B".into(), "koth".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_C".into(), "ctf".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_D".into(), "territory".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_E".into(), "ctf".into(), 0, swarm);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, swarm);
+        apply_proposal(&mut s, "PK_B".into(), ng("koth"), 0, swarm);
+        apply_proposal(&mut s, "PK_C".into(), ng("ctf"), 0, swarm);
+        apply_proposal(&mut s, "PK_D".into(), ng("territory"), 0, swarm);
+        apply_proposal(&mut s, "PK_E".into(), ng("ctf"), 0, swarm);
         assert_eq!(s.phase, GamePhase::Proposing);
 
-        let effects = apply_proposal(&mut s, "PK_F".into(), "ctf".into(), 100, swarm);
+        let effects = apply_proposal(&mut s, "PK_F".into(), ng("ctf"), 100, swarm);
         assert_eq!(s.phase, GamePhase::Voting);
         assert!(
-            matches!(effects.as_slice(), [FsmEffect::AutoVote { game_id }] if game_id == "ctf")
+            matches!(effects.as_slice(), [FsmEffect::AutoVote { choice }] if choice.game_id == "ctf")
         );
     }
 
@@ -329,15 +361,15 @@ mod tests {
         // the timeout.
         let mut s = blank();
         let swarm = 3;
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, swarm);
-        apply_proposal(&mut s, "PK_B".into(), "ctf".into(), 0, swarm);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, swarm);
+        apply_proposal(&mut s, "PK_B".into(), ng("ctf"), 0, swarm);
         assert_eq!(s.phase, GamePhase::Voting);
 
-        apply_vote(&mut s, "PK_A".into(), "ctf".into(), 100, swarm);
-        apply_vote(&mut s, "PK_B".into(), "koth".into(), 200, swarm);
+        apply_vote(&mut s, "PK_A".into(), ng("ctf"), 100, swarm);
+        apply_vote(&mut s, "PK_B".into(), ng("koth"), 200, swarm);
         assert_eq!(s.phase, GamePhase::Voting);
 
-        let effects = apply_vote(&mut s, "PK_C".into(), "territory".into(), 300, swarm);
+        let effects = apply_vote(&mut s, "PK_C".into(), ng("territory"), 300, swarm);
         assert!(effects.is_empty());
         assert_eq!(s.phase, GamePhase::NoGame);
         assert!(s.vote_window.is_none());
@@ -350,10 +382,10 @@ mod tests {
         // majority — we detect the split as soon as the second proposal
         // arrives and drop back to NoGame.
         let mut s = blank();
-        apply_proposal(&mut s, "PK_A".into(), "ctf".into(), 0, 2);
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, 2);
         assert_eq!(s.phase, GamePhase::Proposing);
 
-        let effects = apply_proposal(&mut s, "PK_B".into(), "koth".into(), 100, 2);
+        let effects = apply_proposal(&mut s, "PK_B".into(), ng("koth"), 100, 2);
         assert!(effects.is_empty());
         assert_eq!(s.phase, GamePhase::NoGame);
         assert!(s.proposal_window.is_none());
@@ -369,5 +401,140 @@ mod tests {
         let effects = on_tick(&mut s, 1_000_000, 3);
         assert!(effects.is_empty());
         assert_eq!(s.phase, GamePhase::Playing);
+    }
+
+    #[test]
+    fn load_game_wipes_prior_rounds_instance_state() {
+        // After a round ends, the next LoadGame must clear the stale
+        // countdown anchor, ready set, scores, and ended-game metadata.
+        // Otherwise `game_time_elapsed_s` fires on the new round as soon
+        // as rules tick, because `countdown_zero_ns + 600s` is in the past.
+        let mut s = blank();
+        s.phase = GamePhase::Ended;
+        s.countdown_zero_ns = Some(1_000_000_000);
+        s.ready_peers = vec!["PK_A".into(), "PK_B".into()];
+        s.scores.insert("red".into(), 42);
+        s.ended_winner_team = Some("red".into());
+        s.ended_reason = Some("10-minute time limit reached".into());
+        s.placement_ok = true;
+        if let Some(e) = s.entities.get_mut("a") {
+            e.entity_type = Some("flag".into());
+            e.team = Some("red".into());
+            e.properties.insert("holding_team".into(), serde_json::json!("red"));
+        }
+
+        // A proposal from Ended should open a fresh round...
+        apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, 2);
+        apply_proposal(&mut s, "PK_B".into(), ng("ctf"), 0, 2);
+        assert_eq!(s.phase, GamePhase::Voting);
+
+        // ...and the vote that locks it in must wipe prior state.
+        apply_vote(&mut s, "PK_A".into(), ng("ctf"), 100, 2);
+        let effects = apply_vote(&mut s, "PK_B".into(), ng("ctf"), 200, 2);
+        assert_eq!(s.phase, GamePhase::Loaded);
+        assert!(
+            matches!(effects.as_slice(), [FsmEffect::LoadGame { choice }] if choice.game_id == "ctf" && !choice.keep_roles)
+        );
+        assert_eq!(s.countdown_zero_ns, None);
+        assert!(s.ready_peers.is_empty());
+        assert!(s.scores.is_empty());
+        assert_eq!(s.ended_winner_team, None);
+        assert_eq!(s.ended_reason, None);
+        assert!(!s.placement_ok);
+        let e = s.entities.get("a").unwrap();
+        assert_eq!(e.entity_type, None);
+        assert_eq!(e.team, None);
+        assert!(e.properties.is_empty());
+    }
+
+    #[test]
+    fn proposal_from_ended_phase_starts_a_new_round() {
+        // Previously, `apply_proposal` bailed out of Ended, which left the
+        // swarm stuck on the prior game's banner until the processes were
+        // restarted. Proposals from Ended now start a fresh Proposing window.
+        let mut s = blank();
+        s.phase = GamePhase::Ended;
+        s.ended_reason = Some("10-minute time limit reached".into());
+        let effects = apply_proposal(&mut s, "PK_A".into(), ng("ctf"), 0, 3);
+        assert!(effects.is_empty());
+        assert_eq!(s.phase, GamePhase::Proposing);
+    }
+
+    // --- Replay (keep-roles) flow ----------------------------------------
+
+    fn replay(game_id: &str) -> GameChoice {
+        GameChoice { game_id: game_id.into(), keep_roles: true }
+    }
+
+    #[test]
+    fn replay_vote_preserves_entity_claims_but_clears_round_state() {
+        // Two-node swarm finishes a freeze_tag round. Both nodes pick
+        // "Replay with existing roles". Post-vote, the roles must still
+        // be claimed (no re-pick required), but scores / properties /
+        // countdown / ready-ups must be wiped so the next round starts
+        // clean.
+        let mut s = blank();
+        s.phase = GamePhase::Ended;
+        s.active_game_id = Some("freeze_tag".into());
+        s.countdown_zero_ns = Some(1_000_000_000);
+        s.ready_peers = vec!["PK_A".into(), "PK_B".into()];
+        s.scores.insert("freezers".into(), 3);
+        s.ended_winner_team = Some("freezers".into());
+        s.ended_reason = Some("All runners frozen simultaneously".into());
+        s.placement_ok = true;
+        if let Some(e) = s.entities.get_mut("a") {
+            e.entity_type = Some("freezer".into());
+            e.team = Some("freezers".into());
+            e.properties
+                .insert("frozen_since_ms".into(), serde_json::json!(1234u64));
+        }
+
+        apply_proposal(&mut s, "PK_A".into(), replay("freeze_tag"), 0, 2);
+        apply_proposal(&mut s, "PK_B".into(), replay("freeze_tag"), 0, 2);
+        assert_eq!(s.phase, GamePhase::Voting);
+        apply_vote(&mut s, "PK_A".into(), replay("freeze_tag"), 100, 2);
+        let effects = apply_vote(&mut s, "PK_B".into(), replay("freeze_tag"), 200, 2);
+
+        assert_eq!(s.phase, GamePhase::Loaded);
+        assert!(
+            matches!(effects.as_slice(), [FsmEffect::LoadGame { choice }] if choice.keep_roles)
+        );
+        // Round state wiped.
+        assert_eq!(s.countdown_zero_ns, None);
+        assert!(s.ready_peers.is_empty());
+        assert!(s.scores.is_empty());
+        assert_eq!(s.ended_winner_team, None);
+        assert_eq!(s.ended_reason, None);
+        assert!(!s.placement_ok);
+        // Claims preserved — the whole point of keep_roles.
+        let e = s.entities.get("a").unwrap();
+        assert_eq!(e.entity_type.as_deref(), Some("freezer"));
+        assert_eq!(e.team.as_deref(), Some("freezers"));
+        // But the per-entity properties are gone (they're round-local state,
+        // not identity — e.g. freeze_tag's frozen_since_ms timestamp).
+        assert!(e.properties.is_empty(), "properties should be cleared: {:?}", e.properties);
+    }
+
+    #[test]
+    fn split_replay_vs_change_roles_aborts_on_final_vote() {
+        // Three-node swarm with each node picking a different post-game
+        // option: Replay (keep_roles=true), Change-Roles (keep_roles=false,
+        // same game_id), and New-Game (different game_id). Since (game_id,
+        // keep_roles) is the consensus key, the three votes tally as three
+        // separate choices, none hits the 2-vote majority, and the round
+        // aborts to NoGame — this is exactly what was promised in the UI
+        // design: Replay and Change-Roles don't silently merge.
+        let mut s = blank();
+        let swarm = 3;
+        apply_proposal(&mut s, "PK_A".into(), replay("freeze_tag"), 0, swarm);
+        apply_proposal(&mut s, "PK_B".into(), replay("freeze_tag"), 0, swarm);
+        assert_eq!(s.phase, GamePhase::Voting);
+
+        apply_vote(&mut s, "PK_A".into(), replay("freeze_tag"), 10, swarm);
+        apply_vote(&mut s, "PK_B".into(), ng("freeze_tag"), 20, swarm);
+        let effects = apply_vote(&mut s, "PK_C".into(), ng("ctf"), 30, swarm);
+        assert!(effects.is_empty());
+        assert_eq!(s.phase, GamePhase::NoGame);
+        assert!(s.vote_window.is_none());
     }
 }

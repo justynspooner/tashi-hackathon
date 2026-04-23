@@ -50,16 +50,45 @@ pub struct EntityRecord {
     pub last_seen_ms: u64,
 }
 
+/// What a peer is proposing/voting for. Bundles the `game_id` with the
+/// `keep_roles` intent so the consensus tally treats "replay freeze_tag
+/// keeping roles" and "replay freeze_tag clearing roles" as distinct
+/// outcomes. Without this, a split 2/2 vote between those two intents could
+/// silently merge and pick one arbitrarily — the opposite of what the
+/// post-game UI asks players to express.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct GameChoice {
+    pub game_id: String,
+    /// `true` means the next round preserves each entity's `entity_type`/
+    /// `team` (the "Replay with existing roles" post-game option). `false`
+    /// means the normal new-game reset — claims are wiped and players have
+    /// to re-enter `PlacingEntities`.
+    #[serde(default)]
+    pub keep_roles: bool,
+}
+
+impl GameChoice {
+    /// Shorthand constructor for the common "fresh game, clear claims" case.
+    /// Used by tests; the wire-message handlers build the struct literally.
+    #[cfg(test)]
+    pub fn new_game(game_id: impl Into<String>) -> Self {
+        Self {
+            game_id: game_id.into(),
+            keep_roles: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProposalWindow {
     pub started_at_ms: u64,
-    pub proposers: HashMap<String, String>, // peer_id -> game_id
+    pub proposers: HashMap<String, GameChoice>, // peer_id -> choice
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VoteWindow {
     pub started_at_ms: u64,
-    pub votes: HashMap<String, String>, // peer_id -> game_id
+    pub votes: HashMap<String, GameChoice>, // peer_id -> choice
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +169,48 @@ impl LocalGameState {
         while self.sensor_history.len() > 256 {
             self.sensor_history.pop_front();
         }
+    }
+
+    /// Reset per-game-instance state when a new game locks in. Keeps peer
+    /// identity and positions (persistent across rounds) but clears the
+    /// countdown anchor, ready set, scores, ended-game metadata, proximity
+    /// tracker, and each entity's prior claim. Without this, the stale
+    /// `countdown_zero_ns` from the previous game would make
+    /// `game_time_elapsed_s` fire immediately on the next round.
+    pub fn reset_for_new_game(&mut self) {
+        self.reset_round_instance_state();
+        for entity in self.entities.values_mut() {
+            entity.entity_type = None;
+            entity.team = None;
+            entity.properties.clear();
+        }
+    }
+
+    /// "Replay with existing roles" reset: wipes everything `reset_for_new_game`
+    /// wipes except each entity's `entity_type` and `team`. Used when the
+    /// post-game UI's Replay button wins consensus — the round restarts with
+    /// the same lineup so players don't have to re-pick. Per-entity
+    /// `properties` (e.g. `frozen_since_ms`) are still cleared: they're
+    /// round-local game state, not identity.
+    pub fn reset_for_new_round_keeping_roles(&mut self) {
+        self.reset_round_instance_state();
+        for entity in self.entities.values_mut() {
+            entity.properties.clear();
+        }
+    }
+
+    /// Wipe round-local state (scores, countdown, ready set, ended-metadata,
+    /// proximity tracker, placement-ok flag). Leaves per-entity fields alone;
+    /// the two public reset methods differ only in whether they also clear
+    /// `entity_type`/`team` afterwards.
+    fn reset_round_instance_state(&mut self) {
+        self.countdown_zero_ns = None;
+        self.ready_peers.clear();
+        self.scores.clear();
+        self.ended_winner_team = None;
+        self.ended_reason = None;
+        self.placement_ok = false;
+        self.proximity_tracker.clear();
     }
 }
 

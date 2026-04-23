@@ -3,12 +3,19 @@
 // component (when it has one).
 //
 // Layout:
-//   [team-bar 3px][status-dot][label][entity-badge?][phase-badge?]
+//   [team-bar 3px][status-dot][label][entity-badge?][decay-badge?][phase-badge?]
 
+import { useEffect, useState } from 'react'
 import { Badge } from '@/components/ui/badge'
 import type { NodeInfo } from '@/types'
-import type { EntityRecord, GamePhase, LocalGameSnapshot } from '@/game/types'
-import { PHASE_COLORS, PHASE_LABELS, entityGlyph } from '@/lib/node-control-helpers'
+import type { EntityRecord, GameConfig, GamePhase, LocalGameSnapshot } from '@/game/types'
+import {
+  PHASE_COLORS,
+  PHASE_LABELS,
+  decayRemainingMs,
+  entityGlyph,
+  extractDecayRules,
+} from '@/lib/node-control-helpers'
 import { teamColor } from '@/game/presentation'
 import { cn } from '@/lib/utils'
 
@@ -18,15 +25,48 @@ interface Props {
   entity: EntityRecord | undefined
   selected: boolean
   onClick: () => void
+  /** Active game config — needed to discover decay rules (e.g. freeze_tag's
+   *  30s `frozen_since_ms` window) so the row can render a per-entity
+   *  countdown chip without hard-coding game-specific property keys. */
+  activeGame?: GameConfig
 }
 
-export function SceneTreeRow({ node, snapshot, entity, selected, onClick }: Props) {
+export function SceneTreeRow({ node, snapshot, entity, selected, onClick, activeGame }: Props) {
   const phase: GamePhase = snapshot?.phase ?? 'no_game'
   const isRunning = node.status === 'running'
   const team = entity?.team ?? null
   const entityType = entity?.entity_type ?? null
   const showPhase = isRunning && phase !== 'no_game'
   const teamBar = team ? teamColor(team) : 'transparent'
+
+  // Re-render at ~4Hz while a decay timer *might* be active so the countdown
+  // chip ticks down smoothly between snapshot arrivals (snapshots only land
+  // every ~1s — without this, the chip would freeze and only update on the
+  // next tick, making the timer feel laggy). The "might be active" check is
+  // a pure property-presence test so it's safe to read during render; the
+  // actual remaining-ms calculation against Date.now() happens below with
+  // the standard 4Hz-tick disable comment.
+  const decayRules = extractDecayRules(activeGame).filter(d => d.targetEntityType === entityType)
+  const hasAnyDecayProperty = decayRules.some(
+    d => entity?.properties?.[d.propertyKey] != null,
+  )
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!hasAnyDecayProperty) return
+    const id = window.setInterval(() => setTick(t => t + 1), 250)
+    return () => window.clearInterval(id)
+  }, [hasAnyDecayProperty])
+
+  // eslint-disable-next-line react-hooks/purity -- 4Hz tick drives re-render (see comment above)
+  const now = Date.now()
+  const decayChip = (() => {
+    for (const d of decayRules) {
+      const remainingMs = decayRemainingMs(entity, d, now)
+      if (remainingMs == null) continue
+      return { label: d.label, remainingS: remainingMs / 1000 }
+    }
+    return null
+  })()
 
   return (
     <button
@@ -68,6 +108,19 @@ export function SceneTreeRow({ node, snapshot, entity, selected, onClick }: Prop
           <span>{entityGlyph(entityType)}</span>
           <span>{entityType}</span>
         </Badge>
+      )}
+
+      {/* Decay countdown chip — e.g. freeze_tag's 30s frozen window. Cyan +
+          pulse to draw the eye when a runner is locked out. */}
+      {decayChip && (
+        <span
+          className="h-4 px-1 rounded text-[9px] font-semibold leading-none flex items-center gap-0.5 shrink-0 bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 animate-pulse tabular-nums"
+          title={`${decayChip.label} — ${decayChip.remainingS.toFixed(1)}s remaining`}
+        >
+          <span>🥶</span>
+          <span className="uppercase tracking-wide">{decayChip.label}</span>
+          <span>{decayChip.remainingS.toFixed(0)}s</span>
+        </span>
       )}
 
       {/* Phase badge — shown only when the node is running and a game is active */}

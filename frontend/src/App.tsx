@@ -97,7 +97,6 @@ export default function App() {
                   snapshots={snapshots}
                   games={games}
                   connected={connected}
-                  eventCount={events.length}
                   eventLogOpen={drawerTab === 'events' && !drawerCollapsed}
                   onToggleEventLog={handleToggleEventLog}
                   onClearArtifacts={handleClearArtifacts}
@@ -133,7 +132,6 @@ export default function App() {
                 <BottomDrawer
                   tab={drawerTab}
                   onTabChange={setDrawerTab}
-                  eventCount={events.length}
                   proofCount={proofs.length}
                   events={<EventLog events={events} onClear={clearEvents} />}
                   timeline={<EventTimeline proofs={proofs} />}

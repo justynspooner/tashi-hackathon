@@ -14,7 +14,6 @@ export type DrawerTab = 'events' | 'timeline' | 'proofs' | 'chart'
 interface Props {
   tab: DrawerTab
   onTabChange: (tab: DrawerTab) => void
-  eventCount: number
   proofCount: number
   events: ReactNode
   timeline: ReactNode
@@ -30,7 +29,6 @@ const COLLAPSED_H = 36
 export function BottomDrawer({
   tab,
   onTabChange,
-  eventCount,
   proofCount,
   events,
   timeline,
@@ -135,11 +133,6 @@ export function BottomDrawer({
           <TabsList className="h-7">
             <TabsTrigger value="events" className="text-[11px] gap-1 h-6 px-2">
               Events
-              {eventCount > 0 && (
-                <Badge variant="secondary" className="text-[10px] px-1 py-0 h-4">
-                  {eventCount}
-                </Badge>
-              )}
             </TabsTrigger>
             <TabsTrigger value="timeline" className="text-[11px] h-6 px-2">
               Timeline

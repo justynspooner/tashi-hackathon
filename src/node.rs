@@ -75,6 +75,11 @@ struct FileCommand {
     x: Option<f32>,
     #[serde(default)]
     y: Option<f32>,
+    /// Threaded into `GameProposal`/`GameVote` payloads. The "propose-replay"
+    /// HTTP endpoint sets this to `true`; the legacy `propose-game/:id` path
+    /// omits it and serde defaults it to `false`.
+    #[serde(default)]
+    keep_roles: bool,
 }
 
 /// Internal request from the control task to the engine task.
@@ -725,27 +730,60 @@ fn handle_vertex_message(
             }
         }
         MessageKind::GameProposal => {
-            if let Some(GamePayload::GameProposal { game_id }) = &wire.game {
+            if let Some(GamePayload::GameProposal { game_id, keep_roles }) = &wire.game {
+                let tag = if *keep_roles { " (replay)" } else { "" };
                 log(
                     "GAME_EVENT",
                     &state.label,
-                    format!("proposal from {peer_short}: {game_id} ({})", wire.message_id),
+                    format!(
+                        "proposal from {peer_short}: {game_id}{tag} ({})",
+                        wire.message_id
+                    ),
                 );
-                let effects =
-                    game_fsm::apply_proposal(&mut state.game_state, peer_id.clone(), game_id.clone(), now, swarm_size);
+                let choice = crate::game_state::GameChoice {
+                    game_id: game_id.clone(),
+                    keep_roles: *keep_roles,
+                };
+                let effects = game_fsm::apply_proposal(
+                    &mut state.game_state,
+                    peer_id.clone(),
+                    choice,
+                    now,
+                    swarm_size,
+                );
                 for eff in effects {
                     match eff {
-                        FsmEffect::AutoVote { game_id } => {
+                        FsmEffect::AutoVote { choice } => {
                             outcome.follow_up_txs.push((
                                 MessageKind::GameVote,
-                                Some(format!("auto-vote {game_id}")),
-                                Some(GamePayload::GameVote { game_id }),
+                                Some(format!("auto-vote {}", choice.game_id)),
+                                Some(GamePayload::GameVote {
+                                    game_id: choice.game_id,
+                                    keep_roles: choice.keep_roles,
+                                }),
                             ));
                         }
-                        FsmEffect::LoadGame { game_id } => {
-                            state.game_state.active_game_id = Some(game_id.clone());
+                        FsmEffect::LoadGame { choice } => {
+                            // `reset_for_new_*` has already run inside the FSM.
+                            // Always drop into `PlacingEntities` — even for
+                            // a keep_roles replay — so the placement
+                            // constraint re-validates against fresh sensor
+                            // readings (players may have moved between
+                            // rounds). The UI renders `ClaimedView` instead
+                            // of `ClaimForm` when `entity_type` is already
+                            // set, so preserved claims skip the pick-a-role
+                            // step without skipping the position check.
+                            state.game_state.active_game_id = Some(choice.game_id.clone());
                             state.game_state.phase = GamePhase::PlacingEntities;
-                            log("GAME_EVENT", &state.label, format!("loaded game: {game_id}"));
+                            log(
+                                "GAME_EVENT",
+                                &state.label,
+                                format!(
+                                    "loaded game: {}{}",
+                                    choice.game_id,
+                                    if choice.keep_roles { " (replay)" } else { "" },
+                                ),
+                            );
                         }
                     }
                 }
@@ -753,19 +791,43 @@ fn handle_vertex_message(
             }
         }
         MessageKind::GameVote => {
-            if let Some(GamePayload::GameVote { game_id }) = &wire.game {
+            if let Some(GamePayload::GameVote { game_id, keep_roles }) = &wire.game {
+                let tag = if *keep_roles { " (replay)" } else { "" };
                 log(
                     "GAME_EVENT",
                     &state.label,
-                    format!("vote from {peer_short}: {game_id} ({})", wire.message_id),
+                    format!(
+                        "vote from {peer_short}: {game_id}{tag} ({})",
+                        wire.message_id
+                    ),
                 );
-                let effects =
-                    game_fsm::apply_vote(&mut state.game_state, peer_id.clone(), game_id.clone(), now, swarm_size);
+                let choice = crate::game_state::GameChoice {
+                    game_id: game_id.clone(),
+                    keep_roles: *keep_roles,
+                };
+                let effects = game_fsm::apply_vote(
+                    &mut state.game_state,
+                    peer_id.clone(),
+                    choice,
+                    now,
+                    swarm_size,
+                );
                 for eff in effects {
-                    if let FsmEffect::LoadGame { game_id } = eff {
-                        state.game_state.active_game_id = Some(game_id.clone());
+                    if let FsmEffect::LoadGame { choice } = eff {
+                        // Same rationale as the GameProposal handler: always
+                        // drop into PlacingEntities so the placement check
+                        // re-runs, even when keep_roles preserves claims.
+                        state.game_state.active_game_id = Some(choice.game_id.clone());
                         state.game_state.phase = GamePhase::PlacingEntities;
-                        log("GAME_EVENT", &state.label, format!("loaded game: {game_id}"));
+                        log(
+                            "GAME_EVENT",
+                            &state.label,
+                            format!(
+                                "loaded game: {}{}",
+                                choice.game_id,
+                                if choice.keep_roles { " (replay)" } else { "" },
+                            ),
+                        );
                     }
                 }
                 game_changed = true;
@@ -1157,18 +1219,28 @@ async fn control_loop(
             if let Some(ref mut rx) = cmd_rx {
                 loop {
                     match rx.try_recv() {
-                        Ok(NodeCommand::ProposeGame(game_id)) => {
+                        Ok(NodeCommand::ProposeGame { game_id, keep_roles }) => {
+                            let note = if keep_roles {
+                                format!("propose {game_id} (replay)")
+                            } else {
+                                format!("propose {game_id}")
+                            };
                             game_txs.push((
                                 MessageKind::GameProposal,
-                                Some(format!("propose {game_id}")),
-                                Some(GamePayload::GameProposal { game_id }),
+                                Some(note),
+                                Some(GamePayload::GameProposal { game_id, keep_roles }),
                             ));
                         }
-                        Ok(NodeCommand::VoteGame(game_id)) => {
+                        Ok(NodeCommand::VoteGame { game_id, keep_roles }) => {
+                            let note = if keep_roles {
+                                format!("vote {game_id} (replay)")
+                            } else {
+                                format!("vote {game_id}")
+                            };
                             game_txs.push((
                                 MessageKind::GameVote,
-                                Some(format!("vote {game_id}")),
-                                Some(GamePayload::GameVote { game_id }),
+                                Some(note),
+                                Some(GamePayload::GameVote { game_id, keep_roles }),
                             ));
                         }
                         Ok(NodeCommand::ClaimEntity { entity_type, team }) => {
@@ -1251,19 +1323,37 @@ async fn control_loop(
                                 }
                                 "propose_game" => {
                                     if let Some(game_id) = cmd.game_id {
+                                        let keep_roles = cmd.keep_roles;
+                                        let note = if keep_roles {
+                                            format!("propose {game_id} (replay)")
+                                        } else {
+                                            format!("propose {game_id}")
+                                        };
                                         game_txs.push((
                                             MessageKind::GameProposal,
-                                            Some(format!("propose {game_id}")),
-                                            Some(GamePayload::GameProposal { game_id }),
+                                            Some(note),
+                                            Some(GamePayload::GameProposal {
+                                                game_id,
+                                                keep_roles,
+                                            }),
                                         ));
                                     }
                                 }
                                 "vote_game" => {
                                     if let Some(game_id) = cmd.game_id {
+                                        let keep_roles = cmd.keep_roles;
+                                        let note = if keep_roles {
+                                            format!("vote {game_id} (replay)")
+                                        } else {
+                                            format!("vote {game_id}")
+                                        };
                                         game_txs.push((
                                             MessageKind::GameVote,
-                                            Some(format!("vote {game_id}")),
-                                            Some(GamePayload::GameVote { game_id }),
+                                            Some(note),
+                                            Some(GamePayload::GameVote {
+                                                game_id,
+                                                keep_roles,
+                                            }),
                                         ));
                                     }
                                 }
@@ -1341,13 +1431,17 @@ async fn control_loop(
                 last_fsm_tick_ms = now;
                 let effects = game_fsm::on_tick(&mut state.game_state, now, swarm_size);
                 for eff in effects {
-                    if let FsmEffect::LoadGame { game_id } = eff {
-                        state.game_state.active_game_id = Some(game_id.clone());
+                    if let FsmEffect::LoadGame { choice } = eff {
+                        state.game_state.active_game_id = Some(choice.game_id.clone());
                         state.game_state.phase = GamePhase::PlacingEntities;
                         log(
                             "GAME_EVENT",
                             &state.label,
-                            format!("loaded game (timeout): {game_id}"),
+                            format!(
+                                "loaded game (timeout): {}{}",
+                                choice.game_id,
+                                if choice.keep_roles { " (replay)" } else { "" },
+                            ),
                         );
                         crate::state::persist_game_state(&state)?;
                     }

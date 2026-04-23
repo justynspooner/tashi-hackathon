@@ -236,6 +236,27 @@ enum Predicate {
     /// pinned yet (game hasn't started, or `countdown_zero_ns` is `None`), the
     /// predicate is `false`.
     GameTimeElapsedS { min_s: u64 },
+    /// True once `ctx.local.scores[team]` ≥ `min`. Intended as the trigger
+    /// for an `end_game` effect anchored on a neutral/stable entity so only
+    /// one node broadcasts the `GameEnd`. Missing team key counts as 0.
+    ScoreAtLeast { team: String, min: i64 },
+    /// True when `self_entity.properties[key]` is a number and
+    /// `ctx.now_ms - value < max_age_ms`. Intended for self-scoped "am I
+    /// recently flagged?" checks — e.g. "am I currently frozen" (property
+    /// set within the last 30s) so a rule can gate on its own time-bounded
+    /// state without needing to clear the property at expiry. Missing or
+    /// non-numeric properties evaluate to `false`.
+    PropertyAgeMs { key: String, max_age_ms: u64 },
+    /// True when *every* entity of `entity_type` has `properties[key]` set
+    /// to a number within the last `max_age_ms` of `ctx.now_ms`. Empty
+    /// matching sets evaluate to `false` (vacuously-true would be a surprise
+    /// for callers gating win-conditions on population counts). Intended for
+    /// aggregate "have all runners been frozen simultaneously?" checks.
+    AllEntitiesPropertyRecent {
+        entity_type: String,
+        key: String,
+        max_age_ms: u64,
+    },
 }
 
 /// Effect AST. Anything a game rule's `effect` block can express.
@@ -247,6 +268,16 @@ enum Effect {
     /// actor's team at evaluation time.
     SetProperty {
         target_entity_type: String,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Set a property on *only* the self-entity (the entity the rule is
+    /// currently evaluating against). Unlike `SetProperty`, this emits a
+    /// single per-peer patch. Intended for per-entity state that must be
+    /// kept distinct between instances of the same entity type — e.g.
+    /// freeze_tag's per-runner `frozen_since_ms` timestamp. `value` accepts
+    /// the same `"self.team"` / `"now_ms"` templates as `SetProperty`.
+    SetPropertyOnSelf {
         key: String,
         value: serde_json::Value,
     },
@@ -441,6 +472,49 @@ fn eval_predicate(
             let elapsed_ms = ctx.now_ms.saturating_sub(start_ms);
             elapsed_ms >= min_s.saturating_mul(1_000)
         }
+        Predicate::ScoreAtLeast { team, min } => {
+            ctx.local.scores.get(team).copied().unwrap_or(0) >= *min
+        }
+        Predicate::PropertyAgeMs { key, max_age_ms } => {
+            // Self-scoped: read the property off `self_entity`. Missing or
+            // non-numeric values are `false` — a runner who was never frozen
+            // shouldn't match "am I currently frozen".
+            let Some(v) = self_entity.properties.get(key) else {
+                return false;
+            };
+            let Some(ts) = v.as_u64() else {
+                return false;
+            };
+            ctx.now_ms.saturating_sub(ts) < *max_age_ms
+        }
+        Predicate::AllEntitiesPropertyRecent {
+            entity_type,
+            key,
+            max_age_ms,
+        } => {
+            // Aggregate across every entity of the given type. Requires at
+            // least one match and every match's property to be a numeric
+            // timestamp within the window. Empty sets are `false` so a
+            // "freezers win when all runners frozen" rule doesn't fire before
+            // any runner has even claimed.
+            let mut saw_any = false;
+            for e in ctx.local.entities.values() {
+                if e.entity_type.as_deref() != Some(entity_type.as_str()) {
+                    continue;
+                }
+                saw_any = true;
+                let Some(v) = e.properties.get(key) else {
+                    return false;
+                };
+                let Some(ts) = v.as_u64() else {
+                    return false;
+                };
+                if ctx.now_ms.saturating_sub(ts) >= *max_age_ms {
+                    return false;
+                }
+            }
+            saw_any
+        }
     }
 }
 
@@ -465,6 +539,19 @@ fn apply_effect(
                     value: resolved.clone(),
                 })
                 .collect();
+            RuleDecision::Emit { rule_id: rule_id.to_string(), patches }
+        }
+        Effect::SetPropertyOnSelf { key, value } => {
+            // Exactly one patch, targeted at the self-entity's peer. This is
+            // the "per-entity" counterpart to SetProperty — used when two
+            // instances of the same entity type need independent state
+            // (e.g. two runners each with their own `frozen_since_ms`).
+            let resolved = resolve_template(value, self_entity, ctx);
+            let patches = vec![StatePatch {
+                target_peer_id: self_entity.peer_id.clone(),
+                key: key.clone(),
+                value: resolved,
+            }];
             RuleDecision::Emit { rule_id: rule_id.to_string(), patches }
         }
         Effect::IncrementScore { team, by } => {
@@ -1661,6 +1748,331 @@ mod tests {
         // highest_score picks red (42 > 17).
         assert_eq!(winner.as_deref(), Some("red"), "decisions: {decisions:?}");
         assert!(reason.contains("time limit"), "reason: {reason}");
+    }
+
+    /// Build a single-rule game that ends when `freezers` reaches `min` points,
+    /// anchored on an `entity_is: "flag"` filter so the test harness (which
+    /// inserts a flag as `self`) is the one evaluator that sees the predicate
+    /// fire. Mirrors the freeze_tag.json `freezers_win` rule shape.
+    fn ctf_with_score_threshold(min: i64) -> GameConfig {
+        let mut g = ctf_with_placement();
+        g.rules.push(crate::games::Rule {
+            id: "score_threshold".into(),
+            on: "tick".into(),
+            when: serde_json::json!({
+                "kind": "all",
+                "of": [
+                    { "kind": "entity_is", "entity_type": "flag" },
+                    { "kind": "score_at_least", "team": "freezers", "min": min }
+                ]
+            }),
+            effect: serde_json::json!({
+                "kind": "end_game",
+                "winner_team": "freezers",
+                "reason": "reached threshold"
+            }),
+        });
+        g
+    }
+
+    #[test]
+    fn score_at_least_fires_end_game_when_threshold_met() {
+        let game = ctf_with_score_threshold(5);
+        let mut state = state_with_countdown_zero();
+        state.scores.insert("freezers".into(), 5);
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 };
+        let decisions = tick(&ctx);
+        let ends: Vec<_> = decisions
+            .iter()
+            .filter_map(|d| match d {
+                RuleDecision::End { winner_team, reason } => {
+                    Some((winner_team.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends.len(), 1, "expected one End decision: {decisions:?}");
+        let (winner, reason) = &ends[0];
+        assert_eq!(winner.as_deref(), Some("freezers"), "decisions: {decisions:?}");
+        assert!(reason.contains("threshold"), "reason: {reason}");
+    }
+
+    #[test]
+    fn score_at_least_does_not_fire_below_threshold() {
+        let game = ctf_with_score_threshold(5);
+        let mut state = state_with_countdown_zero();
+        // One shy of the threshold — predicate must be false.
+        state.scores.insert("freezers".into(), 4);
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 };
+        let decisions = tick(&ctx);
+        assert!(
+            decisions.is_empty(),
+            "score_at_least should not fire below threshold: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn score_at_least_treats_missing_team_as_zero() {
+        // Never inserted a `freezers` score → should behave as 0, i.e. not fire.
+        let game = ctf_with_score_threshold(1);
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 3_000 };
+        let decisions = tick(&ctx);
+        assert!(
+            decisions.is_empty(),
+            "missing team key should count as 0: {decisions:?}"
+        );
+    }
+
+    // --- property_age_ms (self-scoped freshness predicate) --------------
+
+    /// Build a single-rule game whose `end_game` effect is gated by
+    /// `property_age_ms` on a flag. Returns a config where the flag (unique
+    /// entity in CTF) fires the end when it has a fresh `marked_ms` property.
+    fn ctf_with_property_age_rule(max_age_ms: u64) -> GameConfig {
+        let mut g = ctf_with_placement();
+        g.rules.push(crate::games::Rule {
+            id: "age_end".into(),
+            on: "tick".into(),
+            when: serde_json::json!({
+                "kind": "all",
+                "of": [
+                    { "kind": "entity_is", "entity_type": "flag" },
+                    { "kind": "property_age_ms", "key": "marked_ms", "max_age_ms": max_age_ms }
+                ]
+            }),
+            effect: serde_json::json!({
+                "kind": "end_game",
+                "winner_team": "red",
+                "reason": "marked recently"
+            }),
+        });
+        g
+    }
+
+    #[test]
+    fn property_age_ms_fires_when_property_is_recent() {
+        let game = ctf_with_property_age_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        let mut flag = entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0)));
+        // Marked 10s ago — within the 30s window.
+        flag.properties.insert("marked_ms".into(), serde_json::json!(0u64));
+        state.entities.insert("me".into(), flag);
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 10_000 };
+        let decisions = tick(&ctx);
+        assert!(
+            decisions
+                .iter()
+                .any(|d| matches!(d, RuleDecision::End { .. })),
+            "expected end: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn property_age_ms_does_not_fire_when_stale() {
+        let game = ctf_with_property_age_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        let mut flag = entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0)));
+        flag.properties.insert("marked_ms".into(), serde_json::json!(0u64));
+        state.entities.insert("me".into(), flag);
+        // 40s elapsed — outside the 30s window.
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 40_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "expected no end: {decisions:?}");
+    }
+
+    #[test]
+    fn property_age_ms_does_not_fire_when_property_missing() {
+        let game = ctf_with_property_age_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 5_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "missing property → false: {decisions:?}");
+    }
+
+    #[test]
+    fn property_age_ms_does_not_fire_when_property_not_numeric() {
+        let game = ctf_with_property_age_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        let mut flag = entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0)));
+        flag.properties
+            .insert("marked_ms".into(), serde_json::json!("now"));
+        state.entities.insert("me".into(), flag);
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 5_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "non-numeric property → false: {decisions:?}");
+    }
+
+    // --- all_entities_property_recent (aggregate freshness predicate) ----
+
+    /// Build a single-rule game where the flag fires `end_game` iff every
+    /// `base` has a fresh `touched_ms` property — used to exercise the
+    /// aggregate "all runners frozen" pattern on CTF's two-base shape.
+    fn ctf_with_all_bases_fresh_rule(max_age_ms: u64) -> GameConfig {
+        let mut g = ctf_with_placement();
+        g.rules.push(crate::games::Rule {
+            id: "all_fresh_end".into(),
+            on: "tick".into(),
+            when: serde_json::json!({
+                "kind": "all",
+                "of": [
+                    { "kind": "entity_is", "entity_type": "flag" },
+                    { "kind": "all_entities_property_recent",
+                      "entity_type": "base",
+                      "key": "touched_ms",
+                      "max_age_ms": max_age_ms }
+                ]
+            }),
+            effect: serde_json::json!({
+                "kind": "end_game",
+                "winner_team": "red",
+                "reason": "all bases touched"
+            }),
+        });
+        g
+    }
+
+    fn insert_base(state: &mut LocalGameState, label: &str, peer_id: &str, team: &str, ts: Option<u64>) {
+        let mut b = entity(label, peer_id, Some("base"), Some(team), Some((0.0, 0.0)));
+        if let Some(v) = ts {
+            b.properties.insert("touched_ms".into(), serde_json::json!(v));
+        }
+        state.entities.insert(label.into(), b);
+    }
+
+    #[test]
+    fn all_entities_property_recent_fires_when_all_fresh() {
+        let game = ctf_with_all_bases_fresh_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        insert_base(&mut state, "br", "PK_BR", "red", Some(1_000));
+        insert_base(&mut state, "bb", "PK_BB", "blue", Some(2_000));
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 5_000 };
+        let decisions = tick(&ctx);
+        assert!(
+            decisions
+                .iter()
+                .any(|d| matches!(d, RuleDecision::End { .. })),
+            "expected end: {decisions:?}"
+        );
+    }
+
+    #[test]
+    fn all_entities_property_recent_false_when_one_is_stale() {
+        let game = ctf_with_all_bases_fresh_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        // Blue base touched 1s ago (fresh); red base touched 40s ago (stale).
+        insert_base(&mut state, "br", "PK_BR", "red", Some(0));
+        insert_base(&mut state, "bb", "PK_BB", "blue", Some(39_000));
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 40_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "one stale → false: {decisions:?}");
+    }
+
+    #[test]
+    fn all_entities_property_recent_false_when_one_is_missing_property() {
+        let game = ctf_with_all_bases_fresh_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        insert_base(&mut state, "br", "PK_BR", "red", Some(1_000));
+        insert_base(&mut state, "bb", "PK_BB", "blue", None); // no touched_ms
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 5_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "missing property on one → false: {decisions:?}");
+    }
+
+    #[test]
+    fn all_entities_property_recent_false_when_no_matching_entities() {
+        // Empty matching set is `false` (not vacuously true) — prevents a
+        // win-condition rule firing before any instances have been claimed.
+        let game = ctf_with_all_bases_fresh_rule(30_000);
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        // No bases in the state at all.
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 5_000 };
+        let decisions = tick(&ctx);
+        assert!(decisions.is_empty(), "empty set → false: {decisions:?}");
+    }
+
+    // --- set_property_on_self (per-entity write effect) ------------------
+
+    #[test]
+    fn set_property_on_self_emits_single_patch_targeting_self_only() {
+        // Rule: on tick, the flag writes its own `marked_ms`. Crucially, this
+        // must NOT fan out to every entity of the same type — the whole point
+        // of `set_property_on_self` is per-entity state for games like
+        // freeze_tag where two runners each need their own timestamp.
+        let mut game = ctf_with_placement();
+        game.rules.push(crate::games::Rule {
+            id: "self_mark".into(),
+            on: "tick".into(),
+            when: serde_json::json!({ "kind": "entity_is", "entity_type": "flag" }),
+            effect: serde_json::json!({
+                "kind": "set_property_on_self",
+                "key": "marked_ms",
+                "value": "now_ms"
+            }),
+        });
+
+        let mut state = state_with_countdown_zero();
+        state.entities.insert(
+            "me".into(),
+            entity("me", "PK_ME", Some("flag"), None, Some((30.0, 15.0))),
+        );
+        // A teammate-style "other" entity of the same type shouldn't matter —
+        // this test only has one flag, but we add a second base to prove
+        // SetProperty and SetPropertyOnSelf diverge: if this rule was a plain
+        // `set_property` on flag, both flag entities would receive patches
+        // (n == 2); on-self should still emit exactly 1 patch.
+        state.entities.insert(
+            "other_flag".into(),
+            entity("other_flag", "PK_OTHER", Some("flag"), None, Some((50.0, 50.0))),
+        );
+
+        let ctx = RuleContext { game: &game, local: &state, now_ms: 7_000 };
+        let decisions = tick(&ctx);
+        let patches = decisions
+            .iter()
+            .find_map(|d| match d {
+                RuleDecision::Emit { rule_id, patches } if rule_id == "self_mark" => {
+                    Some(patches.clone())
+                }
+                _ => None,
+            })
+            .expect("expected self_mark emit");
+        assert_eq!(patches.len(), 1, "should patch only self: {patches:?}");
+        assert_eq!(patches[0].target_peer_id, "PK_ME");
+        assert_eq!(patches[0].key, "marked_ms");
+        assert_eq!(patches[0].value, serde_json::json!(7_000u64));
     }
 
     #[test]

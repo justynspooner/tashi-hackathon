@@ -69,9 +69,21 @@ pub struct StatePatch {
 pub enum GamePayload {
     GameProposal {
         game_id: String,
+        /// When `true`, the next round preserves each entity's `entity_type`/
+        /// `team` — the "Replay with existing roles" post-game option. The
+        /// tally treats `(game_id, keep_roles)` as a distinct choice, so a
+        /// split 2/2 between Replay and Change-Roles won't silently merge.
+        /// Defaults to `false` for backwards-compatibility with older wire
+        /// messages that predate the field.
+        #[serde(default)]
+        keep_roles: bool,
     },
     GameVote {
         game_id: String,
+        /// Mirrors `GameProposal.keep_roles` — votes only coalesce with
+        /// proposals that share the same intent.
+        #[serde(default)]
+        keep_roles: bool,
     },
     EntityTypeClaim {
         entity_type: String,

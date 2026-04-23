@@ -120,6 +120,8 @@ mod tests {
     const CTF_JSON: &str = include_str!("../games/ctf.json");
     const KOTH_JSON: &str = include_str!("../games/king_of_the_hill.json");
     const TERRITORY_JSON: &str = include_str!("../games/territory.json");
+    const CTF_PARK_JSON: &str = include_str!("../games/ctf_park.json");
+    const FREEZE_TAG_JSON: &str = include_str!("../games/freeze_tag.json");
 
     fn parse(name: &str, raw: &str) -> GameConfig {
         serde_json::from_str(raw)
@@ -168,11 +170,133 @@ mod tests {
     }
 
     #[test]
+    fn ctf_park_parses_and_has_expected_shape() {
+        let g = parse("ctf_park.json", CTF_PARK_JSON);
+        assert_eq!(g.id, "ctf_park");
+        assert_eq!(g.teams, vec!["red".to_string(), "blue".to_string()]);
+        assert!(g.entity_types.iter().any(|e| e.id == "flag" && e.team.is_none() && e.max == 1));
+        assert!(g
+            .entity_types
+            .iter()
+            .any(|e| e.id == "jail" && e.team.as_deref() == Some("per_team") && e.max == 1));
+        assert!(g
+            .entity_types
+            .iter()
+            .any(|e| e.id == "base" && e.team.as_deref() == Some("per_team")));
+        assert!(g
+            .entity_types
+            .iter()
+            .any(|e| e.id == "player" && e.min == 4 && e.max == 6));
+        assert_eq!(g.placement.len(), 4);
+        assert_eq!(g.duration_s, Some(420));
+        let rule_ids: Vec<&str> = g.rules.iter().map(|r| r.id.as_str()).collect();
+        assert!(rule_ids.contains(&"mark_flag_holder"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"flag_hold_pulse"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"flag_hold_score"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"mark_jail_liberator"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"jail_free_pulse"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"jail_free_score"), "rules: {rule_ids:?}");
+        assert!(rule_ids.contains(&"time_limit"), "rules: {rule_ids:?}");
+
+        // Lock in that the jail-break rules actually use `different_team: true`.
+        // The park ruleset depends on this filter — losing it silently would
+        // turn jail-camping into self-scoring. Walk the rule JSON to confirm.
+        for id in ["mark_jail_liberator", "jail_free_pulse"] {
+            let rule = g.rules.iter().find(|r| r.id == id).expect(id);
+            let clauses = rule
+                .when
+                .get("of")
+                .and_then(|v| v.as_array())
+                .expect("of[]");
+            let prox = clauses
+                .iter()
+                .find(|c| c.get("kind").and_then(|k| k.as_str()) == Some("proximity_duration_s"))
+                .unwrap_or_else(|| panic!("{id} missing proximity_duration_s"));
+            assert_eq!(
+                prox.get("different_team").and_then(|v| v.as_bool()),
+                Some(true),
+                "{id} must filter different_team: true",
+            );
+        }
+    }
+
+    #[test]
+    fn freeze_tag_parses_and_has_expected_shape() {
+        let g = parse("freeze_tag.json", FREEZE_TAG_JSON);
+        assert_eq!(g.id, "freeze_tag");
+        assert_eq!(g.teams, vec!["freezers".to_string(), "runners".to_string()]);
+        let ids: Vec<&str> = g.entity_types.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"freezer"), "entity_types: {ids:?}");
+        assert!(ids.contains(&"runner"), "entity_types: {ids:?}");
+        // Both teams field 2 players; the demo is a strict 2v2.
+        for et in &g.entity_types {
+            assert_eq!(et.min, 2, "{} min", et.id);
+            assert_eq!(et.max, 2, "{} max", et.id);
+        }
+        assert!(g
+            .entity_types
+            .iter()
+            .any(|e| e.id == "freezer" && e.team.as_deref() == Some("freezers")));
+        assert!(g
+            .entity_types
+            .iter()
+            .any(|e| e.id == "runner" && e.team.as_deref() == Some("runners")));
+        // 5-m freezer↔runner spawn-apart placement is load-bearing for the demo.
+        assert_eq!(g.placement.len(), 1);
+        // 2-minute match timer — runners_win_timeout relies on duration_s being
+        // 120. Changing this without touching the rule would decouple the rule
+        // gate from the user-visible clock.
+        assert_eq!(g.duration_s, Some(120));
+        let rule_ids: Vec<&str> = g.rules.iter().map(|r| r.id.as_str()).collect();
+        for want in ["freeze_runner", "freezers_win", "runners_win_timeout"] {
+            assert!(rule_ids.contains(&want), "missing rule {want} in {rule_ids:?}");
+        }
+
+        // Lock in that the freeze_runner rule actually uses `different_team: true`.
+        // Without that filter a freezer could tag a teammate and freeze them.
+        let freeze_runner = g.rules.iter().find(|r| r.id == "freeze_runner").expect("freeze_runner");
+        let clauses = freeze_runner
+            .when
+            .get("of")
+            .and_then(|v| v.as_array())
+            .expect("of[]");
+        let prox = clauses
+            .iter()
+            .find(|c| c.get("kind").and_then(|k| k.as_str()) == Some("proximity_duration_s"))
+            .expect("freeze_runner missing proximity_duration_s");
+        assert_eq!(
+            prox.get("different_team").and_then(|v| v.as_bool()),
+            Some(true),
+            "freeze_runner must filter different_team: true",
+        );
+
+        // Lock in that the 30-second freeze window threads through every rule.
+        // If one of these drifts (e.g. 30000 on the freeze rule but 60000 on
+        // the win check), runners would appear frozen for longer than the
+        // freeze rule's self-guard, which would silently let them be "frozen"
+        // for the win-condition test while already unfrozen for gameplay.
+        for (rid, want_ms) in [
+            ("freeze_runner", 30_000),
+            ("freezers_win", 30_000),
+            ("runners_win_timeout", 30_000),
+        ] {
+            let json = serde_json::to_string(&g.rules.iter().find(|r| r.id == rid).unwrap().when)
+                .expect("to_string");
+            assert!(
+                json.contains(&format!("\"max_age_ms\":{want_ms}")),
+                "{rid} must reference {want_ms}ms window; got {json}",
+            );
+        }
+    }
+
+    #[test]
     fn all_shipped_configs_have_nonempty_entity_types() {
         for (name, raw) in [
             ("ctf.json", CTF_JSON),
             ("king_of_the_hill.json", KOTH_JSON),
             ("territory.json", TERRITORY_JSON),
+            ("ctf_park.json", CTF_PARK_JSON),
+            ("freeze_tag.json", FREEZE_TAG_JSON),
         ] {
             let g = parse(name, raw);
             assert!(!g.entity_types.is_empty(), "{name}: entity_types must not be empty");
